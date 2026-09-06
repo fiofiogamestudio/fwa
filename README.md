@@ -29,11 +29,11 @@ specification's earlier “FW Agentic” and `fw` command examples map here to t
 independent `fwa` package, `fwa` CLI, and `.fwa` state directory; they do not
 turn FWA into part of the `fw` runtime.
 
-V0.1 ships no FWE adapter, FWE UI, or shared FWA/FWE configuration contract. A
-future FWE integration should consume FWA commands and projections through an
-adapter; neither core should import the other. FWA's package boundary test
-rejects dependencies from core to `fw`, `fwe`, adapters, or third-party
-packages.
+An optional FWE control console now consumes FWA application commands and
+projections through an outer adapter. Neither core imports the other. The
+console uses an explicitly selected independent FWE checkout, not a nested
+copy or npm dependency. FWA's package boundary test rejects dependencies from
+core to `fw`, `fwe`, adapters, or third-party packages.
 
 ## What V0.1 implements
 
@@ -55,7 +55,7 @@ packages.
   offline integrity verification.
 
 Automatic planning, vector/embedding/RAG knowledge systems, planner or reviewer
-swarms, FWE UI, Unity runtime/PlayMode scenarios, screenshots, telemetry,
+swarms, a full visual execution/recovery workflow, Unity runtime/PlayMode scenarios, screenshots, telemetry,
 semantic conflicts, learning, distributed execution, multiple engine adapters,
 authenticated approval, automated game design, and hostile code confinement
 are intentionally outside V0.1.
@@ -70,6 +70,67 @@ are intentionally outside V0.1.
 - Unity Editor only when using the Unity evaluator profile.
 
 FWA has no npm dependencies.
+
+## Optional FWE control console
+
+From the directory containing the independent `fwa/` and `fwe/` checkouts:
+
+```powershell
+node fwa/bin/fwa.js editor --project D:/Games/MyGame --fwe-path D:/Git/fw/fwe
+# Enable only goal.create, plan.load and node.retry:
+node fwa/bin/fwa.js editor --project D:/Games/MyGame --fwe-path D:/Git/fw/fwe --port 3220 --allow-write
+```
+
+The project must already be initialized with `fwa init --project ...`. Launch
+does not initialize, repair, clone, update, reuse or stop another server. It
+binds only `127.0.0.1`; the default port is `3220`. `--json` prints the ready
+URL/project/fingerprint, then the command remains running until stopped.
+
+The Chinese-first console shows the project, Goals, dependency Nodes, Runs,
+Evidence, ChangeSets, Refs, integrations, reversions, and persisted Git fence
+and workspace-lease snapshots. A fence snapshot is not a full `fwa verify`.
+Generic create/save/delete and FWE's stop API are disabled server-side, not
+just hidden in the toolbar. In read-only mode no application commands are
+submitted; existing storage inspection may use its short-lived read guards.
+
+With explicit `--allow-write`, the only accepted commands are `goal.create`,
+`plan.load` (JSON content, never a file path) and `node.retry`. Each command
+goes through `FwaApplication`, requires a command ID, and retains its durable
+idempotency and validation rules. Unconfirmed browser requests retain their
+ID in project-scoped `sessionStorage` across refresh, tab changes and reload;
+successful acknowledgement removes it. If storage is unavailable, dispatch
+fails rather than risking a lost ID. Closing the browser tab or clearing its
+storage loses this local pending lookup: inspect CLI events before repeating
+an uncertain command. Run, evaluate, integrate, revert and all recovery still
+require explicit CLI/API operations; the console never clears a lease or Git
+safety fence on the operator's behalf.
+
+The adapter requires FWE `0.2.0` **with guarded server integration contract v1**.
+Older `0.2.0` checkouts without that capability are rejected. FWE's launch and
+load-time runtime fingerprints, FWA's `src/`, `bin/` and package bytes, fixed
+project identity and write capability participate in the handshake. Every
+HTTP request rechecks source fingerprints. A detected edit, added/removed
+runtime file or unreadable source permanently blocks that server with HTTP
+503; stop it and start a fresh process. Hot replacement is unsupported.
+
+Host and Origin checks cover every route. Mutations additionally require a
+same-origin request, random process-local CSRF token, JSON content type and
+matching console fingerprint. Requests cannot select another project, shell,
+executor, profile or arbitrary file. This is a loopback, trusted-local-user
+control surface, not remote authentication, a plugin sandbox or hostile-code
+containment. Anyone already controlling the local process/browser or source
+checkout is within the trust boundary. Do not expose the port through a proxy
+or port-forward. Concurrent local CLI use still follows the application's
+optimistic event writes, workspace leases and Git fences; the console does
+not create a new cross-process transaction protocol.
+
+For embedding, import `src/editor/server.js` and call
+`startEditor({ projectRoot, fwePath, port, allowWrite, signal })`; the result
+contains `url`, identity/fingerprint fields, `server`, `closed` and `close()`.
+The API permits port `0` for isolated tests, while the CLI requires `1..65535`.
+HTTP integration tests use the sibling FWE when present, or the explicit
+`FWA_TEST_FWE_PATH`; standalone FWA tests report those optional tests skipped
+when FWE is absent. Core and normal CLI operations remain independent.
 
 The ignored `.fwa/**` directory is local engineering evidence, not a publishing
 directory. It can contain model and command output, Unity logs, NUnit reports,
@@ -131,6 +192,7 @@ fwa git recover --fence-id <id> --confirm-processes-stopped
 fwa status
 fwa events
 fwa verify
+fwa editor --fwe-path <absolute FWE checkout> [--port <port>] [--allow-write]
 ```
 
 All commands accept `--project <path>`. Mutating public commands accept a

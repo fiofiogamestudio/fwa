@@ -33,6 +33,7 @@ Usage:
   fwa status [--project <path>] [--json]
   fwa events [--project <path>] [--json]
   fwa verify [--project <path>] [--json]
+  fwa editor --fwe-path <absolute FWE root> [--project <path>] [--port <port>] [--allow-write] [--json]
   fwa help
 
 The target must be a Git worktree whose ignore rules exclude .fwa/**. Runtime
@@ -59,6 +60,8 @@ function parseArguments(argv) {
   const positionals = [];
   const valuedOptions = new Map([
     ['--project', 'project'],
+    ['--fwe-path', 'fwePath'],
+    ['--port', 'port'],
     ['--request', 'request'],
     ['--reason', 'reason'],
     ['--fence-id', 'expectedFenceId'],
@@ -75,6 +78,11 @@ function parseArguments(argv) {
     if (argument === '--json') {
       if (options.json) throw new CliUsageError('--json may be provided only once.');
       options.json = true;
+      continue;
+    }
+    if (argument === '--allow-write') {
+      if (options.allowWrite) throw new CliUsageError('--allow-write may be provided only once.');
+      options.allowWrite = true;
       continue;
     }
     if (argument === '--confirm-processes-stopped') {
@@ -287,6 +295,24 @@ export async function runCli(argv, io = {}) {
     const projectRoot = path.resolve(cwd, options.project ?? '.');
     const application = () => new FwaApplication(projectRoot);
     let result;
+
+    if (positionals[0] === 'editor') {
+      requireShape(positionals, ['editor'], 'fwa editor --fwe-path <absolute path> [--project <path>] [--port <port>] [--allow-write]');
+      rejectOptions(options, ['project', 'fwePath', 'port', 'allowWrite']);
+      if (!options.fwePath || !path.isAbsolute(options.fwePath)) throw new CliUsageError('--fwe-path must be an absolute FWE checkout path.');
+      if (options.port !== undefined && (!/^\d+$/.test(options.port) || Number(options.port) < 1 || Number(options.port) > 65535)) {
+        throw new CliUsageError('--port must be an integer from 1 to 65535.');
+      }
+      const { startEditor } = await import('./editor/server.js');
+      const editor = await startEditor({ projectRoot, fwePath: options.fwePath,
+        port: options.port === undefined ? 3220 : Number(options.port), allowWrite: options.allowWrite === true, signal });
+      const ready = { url: editor.url, projectRoot: editor.projectRoot, projectId: editor.projectId,
+        allowWrite: editor.allowWrite, fingerprint: editor.fingerprint, protocol: editor.protocol, fwePath: editor.fwePath };
+      if (wantsJson) writeJson(stdout, ready);
+      else writeLine(stdout, `FWA console (${editor.allowWrite ? 'controlled write' : 'read-only'}): ${editor.url}\nProject: ${editor.projectRoot}\nFWE: ${editor.fwePath}\nExecution, evaluation, integration and recovery remain explicit CLI operations.`);
+      await editor.closed;
+      return 0;
+    }
 
     if (positionals[0] === 'init') {
       requireShape(positionals, ['init'], 'fwa init [--project <path>] [--json]');
