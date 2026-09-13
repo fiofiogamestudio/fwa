@@ -1,0 +1,24 @@
+{
+  "type": "object", "additionalProperties": false,
+  "required": ["title", "questions", "groups", "nodes"],
+  "properties": {
+    "title": {"type": "string"},
+    "questions": {"type": "array", "items": {"type": "string"}},
+    "groups": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false, "required": ["id", "title", "parentId"],
+      "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "parentId": {"type": "string"}}
+    }},
+    "nodes": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "title", "parentId", "instruction", "dependsOn", "reads", "writes", "checks", "maxFiles", "maxDiffLines"],
+      "properties": {
+        "id": {"type": "string"}, "title": {"type": "string"}, "parentId": {"type": "string"}, "instruction": {"type": "string"},
+        "dependsOn": {"type": "array", "items": {"type": "string"}},
+        "reads": {"type": "array", "items": {"type": "string"}},
+        "writes": {"type": "array", "items": {"type": "string"}},
+        "checks": {"type": "array", "items": {"type": "string"}},
+        "maxFiles": {"type": "integer"}, "maxDiffLines": {"type": "integer"}
+      }
+    }}
+  }
+}

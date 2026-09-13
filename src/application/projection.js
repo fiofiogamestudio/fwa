@@ -1,8 +1,11 @@
+import { createHash } from 'node:crypto';
 import { assertValidPlan, PLAN_SCHEMA_VERSION } from '../core/dag.js';
+import { currentLogicalPlan, nodeDefinition, preparePlanRevision } from '../core/workflow.js';
 import { matchesEffectPattern, normalizeWorkspacePath } from '../core/effects.js';
-import { assertValidEventEnvelope } from '../core/events.js';
+import { assertValidEventEnvelope, stableStringify } from '../core/events.js';
 import {
   areNodeDependenciesSatisfied,
+  findParallelConflicts,
   hasActiveProjectOperation,
   isNodeSchedulable,
   isUnfencedGitProcessFailure,
@@ -17,6 +20,7 @@ import {
   changedRefsForFiles,
   isRefId,
   normalizeRef,
+  resolveNodeEffects,
   refVersionDigest
 } from '../core/refs.js';
 import {
@@ -990,6 +994,8 @@ export function projectEvents(events) {
   const refs = new Map();
   const nodes = new Map();
   const runs = new Map();
+  const runBatches = new Map();
+  const nodeFeedback = new Map();
   const changeSets = new Map();
   const evaluations = new Map();
   const evidence = new Map();
@@ -1049,8 +1055,83 @@ export function projectEvents(events) {
       && !['NodeReady', 'GoalCompleted'].includes(event.type)) {
       goalCompletionWindow = null;
     }
+    if ([...runBatches.values()].some(batch => batch.status === 'running')
+      && ['RefRegistered', 'NodeRetryRequested', 'PlanRevised', 'EvaluationRequested', 'IntegrationRequested', 'ReversionRequested'].includes(event.type)) {
+      throw new ProjectionError('A running batch must settle before another project operation.', 'active-run-batch-exists', event);
+    }
 
     switch (event.type) {
+      case 'RunBatchStarted': {
+        const fields = ['batchId', 'leaseId', 'baseRevision', 'coreIgnoreCase', 'members'];
+        if (Object.hasOwn(event.payload, 'deferred')) fields.push('deferred');
+        const payload = requireExactFields(event.payload, fields, 'payload', event);
+        const id = requireString(payload.batchId, 'batchId', event);
+        requireStream(event, `run-batch:${id}`);
+        if (runBatches.has(id) || hasActiveProjectOperation({ runs: runs.values(), runBatches: runBatches.values(),
+          evaluations: evaluations.values(), integrations: integrations.values(), reversions: reversions.values() })) {
+          throw new ProjectionError('A batch requires a quiescent project and a new identity.', 'active-project-operation-exists', event);
+        }
+        requireString(payload.leaseId, 'leaseId', event);
+        if (typeof payload.baseRevision !== 'string' || !/^([a-f0-9]{40}|[a-f0-9]{64})$/.test(payload.baseRevision)
+          || typeof payload.coreIgnoreCase !== 'boolean' || !Array.isArray(payload.members)
+          || payload.members.length < 1 || payload.members.length > 8) {
+          throw new ProjectionError('Invalid bounded batch manifest.', 'invalid-run-batch', event);
+        }
+        const runIds = new Set(), nodeIds = new Set(), candidates = [];
+        for (const member of payload.members) {
+          requireExactFields(member, ['runId', 'nodeId', 'executor', 'inputHash', 'resources'], 'member', event);
+          requireString(member.runId, 'runId', event); requireString(member.nodeId, 'nodeId', event);
+          requireExactFields(member.executor, ['id', 'version'], 'executor', event);
+          requireString(member.executor.id, 'executor.id', event); requireString(member.executor.version, 'executor.version', event);
+          const node = nodes.get(member.nodeId), goal = goals.get(node?.goalId);
+          if ([...nodeFeedback.values()].some(item => item.goalId === node?.goalId && item.status === 'pending')) {
+            throw new ProjectionError('Resolve pending feedback before starting another batch.', 'pending-node-feedback', event);
+          }
+          if (runIds.has(member.runId) || runs.has(member.runId) || nodeIds.has(member.nodeId)
+            || !node || !goal?.nodeIds.includes(node.id) || !isNodeSchedulable(node, nodes, goal)
+            || node.runIds.length > node.budget.maxRetries
+            || typeof member.inputHash !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(member.inputHash)
+            || stableStringify(member.resources) !== stableStringify(node.resources ?? [])) {
+            throw new ProjectionError('Batch member is duplicate, unschedulable or misbound.', 'invalid-run-batch-member', event);
+          }
+          runIds.add(member.runId); nodeIds.add(member.nodeId);
+          const effects = resolveNodeEffects(node, [...refs.values()]);
+          candidates.push({ nodeId: node.id, reads: effects.reads, writes: effects.writes, resources: node.resources ?? [] });
+        }
+        if (findParallelConflicts(candidates, { ignoreCase: payload.coreIgnoreCase }).length) {
+          throw new ProjectionError('Batch members have conflicting declared effects/resources.', 'run-batch-conflict', event);
+        }
+        if (payload.deferred !== undefined) {
+          if (!Array.isArray(payload.deferred)) throw new ProjectionError('Invalid deferred diagnostics.', 'invalid-run-batch', event);
+          for (const item of payload.deferred) {
+            requireString(item.nodeId, 'deferred.nodeId', event); requireString(item.code, 'deferred.code', event);
+          }
+        }
+        runBatches.set(id, { ...payload, id, status: 'running', createdAt: event.occurredAt,
+          createdSequence: event.sequence, finishedAt: null, outcome: null, reason: null, version: streamVersion });
+        break;
+      }
+      case 'RunBatchFinished': {
+        const payload = requireExactFields(event.payload, ['batchId', 'outcome', 'reason'], 'payload', event);
+        requireStream(event, `run-batch:${payload.batchId}`);
+        const batch = runBatches.get(payload.batchId);
+        const memberRuns = batch?.members.map(member => runs.get(member.runId));
+        if (!batch || batch.status !== 'running' || !['completed', 'reconciled'].includes(payload.outcome)
+          || memberRuns.some(run => !run || !['produced', 'failed'].includes(run.status))) {
+          throw new ProjectionError('A batch can finish only after every recorded member is terminal.', 'run-batch-not-settled', event);
+        }
+        const unconfirmed = memberRuns.some(run => [run.failure, ...(run.cleanupFailures ?? [])].some(failure =>
+          isUnfencedGitProcessFailure(failure) || failure?.code?.includes('termination-unconfirmed')
+          || failure?.details?.terminationConfirmed === false || failure?.details?.process?.terminationConfirmed === false));
+        if ((payload.outcome === 'completed' && unconfirmed)
+          || (payload.outcome === 'reconciled' && (typeof payload.reason !== 'string' || !payload.reason.trim()))
+          || (payload.reason !== null && (typeof payload.reason !== 'string' || payload.reason !== payload.reason.trim()))) {
+          throw new ProjectionError('Unconfirmed members require explicit reconciliation evidence.', 'run-batch-not-settled', event);
+        }
+        batch.status = 'finished'; batch.outcome = payload.outcome; batch.reason = payload.reason;
+        batch.finishedAt = event.occurredAt; batch.version = streamVersion;
+        break;
+      }
       case 'RefRegistered': {
         const payload = requireExactFields(event.payload, [
           'hash', 'id', 'kind', 'metadata', 'uri', 'version'
@@ -1360,7 +1441,112 @@ export function projectEvents(events) {
             event
           );
         }
+        if (event.payload.plan !== undefined) {
+          assertValidPlan(event.payload.plan);
+          const digest = `sha256:${createHash('sha256').update(stableStringify(event.payload.plan)).digest('hex')}`;
+          if (digest !== goal.planHash || stableStringify(event.payload.plan.nodes.map(node => node.id)) !== stableStringify(goal.nodeIds)
+            || (event.payload.plan.goalId !== undefined && event.payload.plan.goalId !== goal.id)) {
+            throw new ProjectionError('Plan snapshot does not bind its declared hash and leaves.', 'plan-snapshot-mismatch', event);
+          }
+        }
+        goal.groups = event.payload.plan?.groups ?? [];
+        goal.planRevision = 1;
+        goal.planHistory = [{ id: `${planId}:revision:1`, planId, revision: 1, previousRevision: null,
+          plan: event.payload.plan ?? null, bindings: [], retiredNodes: [], reason: 'initial-plan', feedbackIds: [], recordedAt: event.occurredAt }];
         goal.version = streamVersion;
+        break;
+      }
+      case 'NodeFeedbackSubmitted': {
+        const payload = requireExactFields(event.payload, ['feedbackId', 'nodeId', 'goalId', 'logicalId',
+          'definitionRevision', 'text', 'deferredAtSubmission'], 'payload', event);
+        const id = requireString(payload.feedbackId, 'feedbackId', event);
+        requireStream(event, `feedback:${id}`);
+        const node = nodes.get(payload.nodeId);
+        const goal = goals.get(payload.goalId);
+        const deferred = hasActiveProjectOperation({ runs: runs.values(), runBatches: runBatches.values(),
+          evaluations: evaluations.values(), integrations: integrations.values(), reversions: reversions.values() });
+        if (nodeFeedback.has(id) || !node || node.goalId !== goal?.id || !goal.nodeIds.includes(node.id)
+          || node.supersededByRevision != null || payload.logicalId !== (node.logicalId ?? node.id)
+          || payload.definitionRevision !== (node.definitionRevision ?? 1) || payload.deferredAtSubmission !== deferred
+          || typeof payload.text !== 'string' || payload.text.length > 16384) {
+          throw new ProjectionError('Feedback must bind a current definition and observed operation state.', 'feedback-node-mismatch', event);
+        }
+        requireString(payload.text, 'text', event);
+        nodeFeedback.set(id, { ...payload, id, status: 'pending', submittedAt: event.occurredAt,
+          appliedRevisionId: null, version: streamVersion });
+        break;
+      }
+      case 'PlanRevised': {
+        const payload = requireExactFields(event.payload, ['goalId', 'planId', 'revisionId', 'expectedRevision',
+          'revision', 'plan', 'bindings', 'retiredNodes', 'reason', 'feedbackIds'], 'payload', event);
+        const goal = goals.get(payload.goalId);
+        requireStream(event, `goal:${payload.goalId}`);
+        const operations = { runs: [...runs.values()], runBatches: [...runBatches.values()], evaluations: [...evaluations.values()],
+          integrations: [...integrations.values()], reversions: [...reversions.values()] };
+        if (hasActiveProjectOperation(operations)) throw new ProjectionError('Plan revision requires settled operations.', 'plan-revision-deferred', event);
+        let prepared;
+        try { prepared = preparePlanRevision(goal, [...nodes.values()], payload.plan, payload.expectedRevision); }
+        catch (error) { throw new ProjectionError(error.message, error.code ?? 'invalid-plan-revision', event); }
+        if (payload.planId !== goal.planId || payload.revision !== prepared.revision
+          || payload.revisionId !== `${goal.planId}:revision:${prepared.revision}`
+          || stableStringify(payload.bindings) !== stableStringify(prepared.bindings)
+          || stableStringify(payload.retiredNodes) !== stableStringify(prepared.retiredNodes)) {
+          throw new ProjectionError('Revision bindings do not match the exact affected definitions.', 'plan-revision-binding-mismatch', event);
+        }
+        requireString(payload.reason, 'reason', event);
+        const feedbackIds = requireUniqueStringArray(payload.feedbackIds, 'feedbackIds', event);
+        for (const retired of prepared.retiredNodes) {
+          if (nodeHasUnsettledWorkspace(nodes.get(retired.nodeId), operations)) {
+            throw new ProjectionError('Affected Node still owns an unsettled workspace.', 'node-workspace-not-settled', event);
+          }
+        }
+        if ([...nodeFeedback.values()].some(item => item.goalId === goal.id && item.status === 'pending'
+          && prepared.retiredNodes.some(retired => retired.nodeId === item.nodeId) && !feedbackIds.includes(item.id))) {
+          throw new ProjectionError('A revision cannot strand pending feedback on a superseded Node.', 'feedback-revision-incomplete', event);
+        }
+        for (const id of feedbackIds) {
+          const feedback = nodeFeedback.get(id);
+          if (!feedback || feedback.goalId !== goal.id || feedback.status !== 'pending'
+            || !prepared.retiredNodes.some(item => item.nodeId === feedback.nodeId)) {
+            throw new ProjectionError('Feedback does not bind an affected pending Node.', 'feedback-revision-mismatch', event);
+          }
+          feedback.status = 'applied'; feedback.appliedRevisionId = payload.revisionId;
+          feedback.appliedAt = event.occurredAt;
+        }
+        goal.planHistory[0].plan ??= currentLogicalPlan(goal, [...nodes.values()]);
+        goal.nodeIds = prepared.nodeIds;
+        goal.groups = prepared.groups;
+        goal.planRevision = prepared.revision;
+        goal.planHash = `sha256:${createHash('sha256').update(stableStringify(prepared.plan)).digest('hex')}`;
+        if (prepared.createdNodes.length || prepared.retiredNodes.length) {
+          const allDone = prepared.nodeIds.every(id => {
+            const node = nodes.get(id);
+            return node?.status === NodeStatus.ACCEPTED && node.validity === Validity.VALID
+              && node.integrationStatus === IntegrationStatus.INTEGRATED && node.acceptedChangeSetId != null
+              && node.acceptedChangeSetId === node.integratedChangeSetId && goal.integrationTargetRef != null
+              && node.integratedTargetRef === goal.integrationTargetRef;
+          });
+          goal.status = allDone ? GoalStatus.COMPLETED : goal.runIds.length ? GoalStatus.ACTIVE : GoalStatus.PLANNED;
+        }
+        goal.planHistory.push({ id: payload.revisionId, planId: goal.planId, revision: prepared.revision,
+          previousRevision: payload.expectedRevision, plan: prepared.plan, bindings: prepared.bindings,
+          retiredNodes: prepared.retiredNodes, reason: payload.reason, feedbackIds, recordedAt: event.occurredAt });
+        goal.version = streamVersion;
+        break;
+      }
+      case 'NodeSuperseded': {
+        const payload = requireExactFields(event.payload, ['nodeId', 'replacementNodeId', 'goalId', 'revisionId'], 'payload', event);
+        requireStream(event, `node:${payload.nodeId}`);
+        const node = nodes.get(payload.nodeId), goal = goals.get(payload.goalId);
+        const revision = goal?.planHistory.at(-1);
+        if (!node || node.goalId !== goal?.id || node.supersededByRevision != null
+          || revision?.id !== payload.revisionId || goal.nodeIds.includes(node.id)
+          || !revision.retiredNodes.some(item => item.nodeId === node.id && item.replacementNodeId === payload.replacementNodeId)) {
+          throw new ProjectionError('Supersession is not bound to the current plan revision.', 'node-supersession-mismatch', event);
+        }
+        node.supersededByRevision = payload.revisionId;
+        node.supersededByNodeId = payload.replacementNodeId;
+        node.version = streamVersion;
         break;
       }
       case 'NodePlanned': {
@@ -1373,6 +1559,10 @@ export function projectEvents(events) {
           );
         }
         const nodeId = requireString(node.id, 'node.id', event);
+        if (Object.keys(node).some(key => !['id', 'title', 'parentId', 'resources', 'instruction', 'referenceInputs',
+          'dependsOn', 'reads', 'writes', 'capabilities', 'acceptance', 'budget'].includes(key))) {
+          throw new ProjectionError('Node definition contains unsupported fields.', 'invalid-node-definition', event);
+        }
         const goalId = requireString(event.payload.goalId, 'goalId', event);
         const planId = requireString(event.payload.planId, 'planId', event);
         requireStream(event, `node:${nodeId}`);
@@ -1391,8 +1581,30 @@ export function projectEvents(events) {
             event
           );
         }
+        const revision = goal.planHistory.at(-1);
+        const logicalDefinition = event.payload.definition;
+        if (goal.planRevision > 1) {
+          const binding = revision.bindings.find(item => item.nodeId === nodeId && item.created);
+          const authored = revision.plan.nodes.find(item => item.id === binding?.logicalId);
+          const mapped = new Map(revision.bindings.map(item => [item.logicalId, item.nodeId]));
+          const expected = authored && { ...authored, id: nodeId, dependsOn: authored.dependsOn.map(id => mapped.get(id)) };
+          if (!binding || stableStringify(binding) !== stableStringify(logicalDefinition)
+            || stableStringify(node) !== stableStringify(expected)) {
+            throw new ProjectionError('New physical Node must exactly match its revision definition.', 'node-revision-mismatch', event);
+          }
+        } else {
+          if (logicalDefinition !== undefined || (revision.plan
+            && stableStringify(revision.plan.nodes.find(item => item.id === nodeId)) !== stableStringify(node))) {
+            throw new ProjectionError('Initial Node differs from its authored plan.', 'node-plan-mismatch', event);
+          }
+          revision.bindings.push({ logicalId: nodeId, nodeId, created: true, definitionRevision: 1, supersedesNodeId: null });
+        }
         nodes.set(nodeId, {
           ...node,
+          logicalId: logicalDefinition?.logicalId ?? nodeId,
+          definitionRevision: logicalDefinition?.definitionRevision ?? 1,
+          supersededByRevision: null,
+          supersededByNodeId: null,
           goalId,
           planId,
           status: NodeStatus.PLANNED,
@@ -1538,6 +1750,19 @@ export function projectEvents(events) {
         const nodeId = requireString(event.payload.nodeId, 'nodeId', event);
         const goalId = requireString(event.payload.goalId, 'goalId', event);
         const planId = requireString(event.payload.planId, 'planId', event);
+        if ([...nodeFeedback.values()].some(item => item.goalId === goalId && item.status === 'pending')) {
+          throw new ProjectionError('Resolve pending feedback before creating another Run.', 'pending-node-feedback', event);
+        }
+        const batchId = event.payload.batchId;
+        const batch = batchId === undefined ? null : runBatches.get(batchId);
+        const member = batch?.members.find(item => item.runId === runId);
+        if ((batchId !== undefined && (!batch || batch.status !== 'running' || !member
+          || member.nodeId !== nodeId || member.inputHash !== event.payload.inputHash
+          || stableStringify(member.executor) !== stableStringify(event.payload.executor)
+          || batch.baseRevision !== event.payload.baseRevision))
+          || (batchId === undefined && [...runBatches.values()].some(item => item.status === 'running'))) {
+          throw new ProjectionError('Run must match its active batch manifest.', 'run-batch-binding-mismatch', event);
+        }
         requireStream(event, `run:${runId}`);
         if (runs.has(runId)) {
           throw new ProjectionError(
@@ -1583,7 +1808,7 @@ export function projectEvents(events) {
           run.status === RunStatus.PENDING
           || run.status === RunStatus.RUNNING
           || run.status === RunStatus.PAUSED
-        ))) {
+        ) && (!batch || run.batchId !== batchId || run.nodeId === nodeId))) {
           throw new ProjectionError(
             'A serial FWA project cannot contain more than one active Run.',
             'active-run-exists',
@@ -1660,6 +1885,7 @@ export function projectEvents(events) {
           version: streamVersion
         };
         runs.set(runId, run);
+        if (batch) run.batchId = batch.id;
         node.runIds.push(runId);
         goal.runIds.push(runId);
         break;
@@ -1748,6 +1974,9 @@ export function projectEvents(events) {
         run.workspacePath = requireString(event.payload.workspacePath, 'workspacePath', event);
         run.workspaceStatus = 'present';
         run.leaseId = requireString(event.payload.leaseId, 'leaseId', event);
+        if (run.batchId !== undefined && run.leaseId !== runBatches.get(run.batchId)?.leaseId) {
+          throw new ProjectionError('Run lease differs from its batch owner.', 'run-batch-lease-mismatch', event);
+        }
         run.startedAt = event.occurredAt;
         run.version = streamVersion;
         break;
@@ -5036,6 +5265,14 @@ export function projectEvents(events) {
 
   for (const goal of goals.values()) {
     if (goal.planId === null) continue;
+    for (const revision of goal.planHistory ?? []) {
+      for (const retired of revision.retiredNodes) {
+        const node = nodes.get(retired.nodeId);
+        if (!node || node.supersededByRevision !== revision.id || node.supersededByNodeId !== retired.replacementNodeId) {
+          throw new ProjectionError('Plan revision is missing its explicit Node supersession.', 'incomplete-plan-revision');
+        }
+      }
+    }
     for (const nodeId of goal.nodeIds) {
       const node = nodes.get(nodeId);
       if (!node || node.goalId !== goal.id || node.planId !== goal.planId) {
@@ -5044,41 +5281,14 @@ export function projectEvents(events) {
           'incomplete-plan-projection'
         );
       }
+      if (node.supersededByRevision != null) throw new ProjectionError('Current plan contains a superseded Node.', 'incomplete-plan-revision');
     }
-    const planNodes = goal.nodeIds.map((nodeId) => {
-      const {
-        goalId,
-        planId,
-        status,
-        validity,
-        integrationStatus,
-        runIds,
-        changeSetIds,
-        revertChangeSetIds,
-        evaluationIds,
-        activeEvaluationId,
-        acceptedChangeSetId,
-        acceptanceEvidenceIds,
-        integrationIds,
-        activeIntegrationId,
-        integratedChangeSetId,
-        integratedRevision,
-        integratedTargetRef,
-        revertedByReversionId,
-        staleByIntegrationIds,
-        staleByReversionIds,
-        retryHistory,
-        retrySequence,
-        readySequence,
-        version,
-        ...node
-      } = nodes.get(nodeId);
-      return node;
-    });
+    const planNodes = goal.nodeIds.map(nodeId => nodeDefinition(nodes.get(nodeId)));
     try {
       assertValidPlan({
         schemaVersion: PLAN_SCHEMA_VERSION,
         goalId: goal.id,
+        groups: goal.groups ?? [],
         nodes: planNodes
       });
     } catch (error) {
@@ -5753,8 +5963,15 @@ export function projectEvents(events) {
     }
   }
 
+  for (const batch of runBatches.values()) {
+    if (batch.members.some(member => runs.get(member.runId)?.batchId !== batch.id)) {
+      throw new ProjectionError('Batch manifest must atomically register every member Run.', 'incomplete-run-batch');
+    }
+  }
   return {
     lastSequence,
+    runBatches: [...runBatches.values()],
+    nodeFeedback: [...nodeFeedback.values()],
     refs: [...refs.values()].sort((left, right) => left.id.localeCompare(right.id)),
     goals: [...goals.values()].sort((left, right) => left.id.localeCompare(right.id)),
     nodes: [...nodes.values()].sort((left, right) => left.id.localeCompare(right.id)),

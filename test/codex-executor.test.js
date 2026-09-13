@@ -86,6 +86,21 @@ function createSpawnFake(script, { closeOnKill = true } = {}) {
   return { calls, spawnImpl };
 }
 
+test('planning uses explicit read-only sandbox and schema without accepting broader permission modes', async () => {
+  const workspaceRoot = await temporaryWorkspace();
+  const schema = path.join(workspaceRoot, 'schema.json'); await writeFile(schema, '{}');
+  const fake = createSpawnFake(({ child, close }) => { child.stdout.end('{"type":"turn.completed"}\n'); child.stderr.end(); close(0); });
+  const executor = new CodexExecutor({ executable: 'fake-codex', platform: 'linux', spawnImpl: fake.spawnImpl, sandbox: 'read-only', outputSchema: schema });
+  const result = await executor.execute({ workspaceRoot, node: projectionNode(), input: codexInput() });
+  assert.equal(result.codex.sandbox, 'read-only-requested');
+  assert.equal(fake.calls[0].args[fake.calls[0].args.indexOf('--sandbox') + 1], 'read-only');
+  assert.equal(fake.calls[0].args[fake.calls[0].args.indexOf('--output-schema') + 1], schema);
+  assert.ok(!fake.calls[0].args.includes('--full-auto'));
+  assert.throws(() => new CodexExecutor({ sandbox: 'danger-full-access' }), { code: 'FWA_INVALID_CODEX_EXECUTOR_OPTIONS' });
+  await assert.rejects(executor.execute({ workspaceRoot, node: projectionNode(), input: codexInput({ windowsSandboxOverride: 'elevated' }) }), { code: 'FWA_INVALID_CODEX_EXECUTOR_INPUT' });
+  assert.equal(fake.calls.length, 1);
+});
+
 test('is a core-compatible executor and invokes non-interactive Codex with fixed cwd', async () => {
   const workspaceRoot = await temporaryWorkspace();
   const fake = createSpawnFake(({ child, close }) => {
@@ -125,7 +140,7 @@ test('is a core-compatible executor and invokes non-interactive Codex with fixed
     '--color',
     'never',
     '--ephemeral',
-    '--full-auto',
+    '--sandbox', 'workspace-write',
     '--cd',
     path.resolve(workspaceRoot),
     '--model',
@@ -192,7 +207,7 @@ test('only ignores user configuration when the input explicitly opts in', async 
     'never',
     '--ephemeral',
     '--ignore-user-config',
-    '--full-auto',
+    '--sandbox', 'workspace-write',
     '--cd',
     path.resolve(workspaceRoot),
     '--model',
@@ -237,7 +252,7 @@ test('adds only the fixed elevated Windows sandbox override after explicit opt-i
     '--ignore-user-config',
     '-c',
     "windows.sandbox='elevated'",
-    '--full-auto',
+    '--sandbox', 'workspace-write',
     '--cd',
     path.resolve(workspaceRoot),
     '--model',

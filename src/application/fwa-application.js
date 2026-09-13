@@ -11,6 +11,8 @@ import { createEvent, stableStringify } from '../core/events.js';
 import { validateEvidenceAgainstProfile } from '../core/evaluator.js';
 import { isRefId, normalizeRef } from '../core/refs.js';
 import { GoalStatus } from '../core/state-machines.js';
+import { INTERACTION_FIELDS } from '../core/interaction-contract.js';
+import { buildWorkflow, preparePlanRevision } from '../core/workflow.js';
 import { hasActiveProjectOperation, nodeHasUnsettledWorkspace, nodeRetryEligibility } from '../core/scheduling.js';
 import {
   FileEventStore,
@@ -176,7 +178,7 @@ function canonicalNode(node, index) {
   }
   const path = `nodes[${index}]`;
   rejectUnknownFields(node, [
-    'id', 'title',
+    'id', 'title', 'parentId', 'resources', 'instruction', 'referenceInputs',
     'dependsOn', 'depends_on',
     'reads', 'writes',
     'capabilities', 'requires',
@@ -207,6 +209,9 @@ function canonicalNode(node, index) {
     budget: canonicalBudget(node.budget, `${path}.budget`)
   };
   if (Object.hasOwn(node, 'title')) result.title = node.title;
+  for (const field of ['parentId', 'resources', 'instruction', 'referenceInputs']) {
+    if (Object.hasOwn(node, field)) result[field] = cloneJson(node[field], `${path}.${field}`);
+  }
   return result;
 }
 
@@ -215,7 +220,7 @@ export function canonicalizePlan(plan) {
     assertValidPlan(plan);
   }
 
-  rejectUnknownFields(plan, ['schemaVersion', 'id', 'goalId', 'goal_id', 'nodes'], '$');
+  rejectUnknownFields(plan, ['schemaVersion', 'id', 'goalId', 'goal_id', 'groups', 'nodes'], '$');
   const schemaVersion = Object.hasOwn(plan, 'schemaVersion')
     ? plan.schemaVersion
     : PLAN_SCHEMA_VERSION;
@@ -234,6 +239,7 @@ export function canonicalizePlan(plan) {
       : plan.nodes
   };
   if (Object.hasOwn(plan, 'id')) result.id = plan.id;
+  if (Object.hasOwn(plan, 'groups')) result.groups = cloneJson(plan.groups, 'groups');
   const goalId = aliasedValue(plan, ['goalId', 'goal_id'], 'goalId');
   if (goalId !== undefined) result.goalId = goalId;
 
@@ -527,6 +533,7 @@ export class FwaApplication {
         goalId: normalizedGoalId,
         planId,
         planHash,
+        plan: authoredPlan,
         nodeIds: authoredPlan.nodes.map((node) => node.id)
       },
       streamVersion: goal.version + 1
@@ -587,6 +594,136 @@ export class FwaApplication {
     );
   }
 
+  async submitNodeFeedback({ nodeId, text, commandId } = {}) {
+    requireTrimmedString(nodeId, 'nodeId');
+    requireTrimmedString(text, 'text');
+    if (text.length > INTERACTION_FIELDS.feedback.maxLength) throw new FwaApplicationError(`Feedback exceeds ${INTERACTION_FIELDS.feedback.maxLength} characters.`, 'invalid-command');
+    const normalizedCommandId = this.#commandId(commandId);
+    const intentHash = hashCanonicalValue({ schemaVersion: 1, type: 'SubmitNodeFeedback', nodeId, text });
+    for (let attempt = 0; ; attempt++) {
+      const state = await this.#readState();
+      const existing = recordedBatch(state.store, normalizedCommandId, intentHash);
+      if (existing) {
+        const id = eventFromBatch(existing, 'NodeFeedbackSubmitted').payload.feedbackId;
+        const feedback = state.projection.nodeFeedback.find(item => item.id === id);
+        return { appended: false, commandId: normalizedCommandId, feedback, deferred: feedback.deferredAtSubmission };
+      }
+      const node = state.projection.nodes.find(item => item.id === nodeId);
+      const goal = state.projection.goals.find(item => item.id === node?.goalId);
+      if (!node || !goal?.nodeIds.includes(nodeId) || node.supersededByRevision != null) {
+        throw new FwaApplicationError('Feedback must target a current leaf Node.', 'node-not-current');
+      }
+      const deferred = hasActiveProjectOperation(state.projection);
+      const feedbackId = this.#id('feedback');
+      const event = this.#event({ type: 'NodeFeedbackSubmitted', streamId: `feedback:${feedbackId}`,
+        sequence: state.store.lastSequence + 1, streamVersion: 1, commandId: normalizedCommandId,
+        payload: { feedbackId, nodeId, goalId: goal.id, logicalId: node.logicalId ?? node.id,
+          definitionRevision: node.definitionRevision ?? 1, text, deferredAtSubmission: deferred } });
+      const projection = projectEvents([...state.store.events, event]);
+      try {
+        const write = await this.#withLockRetry(() => this.#appendBatch(normalizedCommandId, [event], {
+          expectedLastSequence: state.store.lastSequence, intentHash
+        }));
+        const current = write.appended ? projection : (await this.#readState()).projection;
+        const id = eventFromBatch(write.batch, 'NodeFeedbackSubmitted').payload.feedbackId;
+        const feedback = current.nodeFeedback.find(item => item.id === id);
+        return { appended: write.appended, commandId: normalizedCommandId,
+          feedback, deferred: feedback.deferredAtSubmission };
+      } catch (error) {
+        if (error.code !== 'concurrency-conflict' || attempt >= this.lockRetryDelays.length) throw error;
+      }
+    }
+  }
+
+  async revisePlan({ goalId, plan, expectedRevision, reason, feedbackIds = [], commandId } = {}) {
+    requireTrimmedString(goalId, 'goalId');
+    requireTrimmedString(reason, 'reason');
+    if (!Array.isArray(feedbackIds) || new Set(feedbackIds).size !== feedbackIds.length
+      || feedbackIds.some(id => typeof id !== 'string' || !id || id !== id.trim())) {
+      throw new FwaApplicationError('feedbackIds must contain distinct feedback ids.', 'invalid-command');
+    }
+    const canonicalPlan = canonicalizePlan(plan);
+    const normalizedCommandId = this.#commandId(commandId);
+    const intentHash = hashCanonicalValue({ schemaVersion: 1, type: 'RevisePlan', goalId,
+      plan: canonicalPlan, expectedRevision, reason, feedbackIds });
+    const result = (projection, event, appended) => {
+      const goal = projection.goals.find(item => item.id === goalId);
+      const revision = goal.planHistory.find(item => item.revision === event.payload.revision);
+      return { appended, commandId: normalizedCommandId, revision, goal,
+        nodes: projection.nodes.filter(item => goal.nodeIds.includes(item.id)),
+        nodeBindings: revision.bindings, feedback: projection.nodeFeedback.filter(item => item.goalId === goalId) };
+    };
+    let state = await this.#readState();
+    const existing = recordedBatch(state.store, normalizedCommandId, intentHash);
+    if (existing) return result(state.projection, eventFromBatch(existing, 'PlanRevised'), false);
+    if (hasActiveProjectOperation(state.projection)) {
+      throw new FwaApplicationError('Revision is not applied while a project operation is active. Feedback remains pending.', 'plan-revision-deferred');
+    }
+    await this.#leaseOperation(() => this.lease.init());
+    const reservation = await this.#leaseOperation(() => this.lease.acquire({ runId: this.#id('revision'), ttlMs: 30000 }));
+    try {
+      state = await this.#readState();
+      const replay = recordedBatch(state.store, normalizedCommandId, intentHash);
+      if (replay) return result(state.projection, eventFromBatch(replay, 'PlanRevised'), false);
+      if (hasActiveProjectOperation(state.projection)) throw new FwaApplicationError('Wait for active operations before applying a revision.', 'plan-revision-deferred');
+      const goal = state.projection.goals.find(item => item.id === goalId);
+      const prepared = preparePlanRevision(goal, state.projection.nodes, canonicalPlan, expectedRevision);
+      for (const { nodeId } of prepared.retiredNodes) {
+        const node = state.projection.nodes.find(item => item.id === nodeId);
+        if (nodeHasUnsettledWorkspace(node, state.projection)) throw new FwaApplicationError('Settle affected Node workspaces before revising.', 'node-workspace-not-settled');
+      }
+      const omittedFeedback = state.projection.nodeFeedback.filter(item => item.goalId === goalId && item.status === 'pending'
+        && prepared.retiredNodes.some(retired => retired.nodeId === item.nodeId) && !feedbackIds.includes(item.id));
+      if (omittedFeedback.length) throw new FwaApplicationError('Explicitly include all pending feedback for each superseded Node.',
+        'feedback-revision-incomplete', { feedbackIds: omittedFeedback.map(item => item.id) });
+      for (const id of feedbackIds) {
+        const feedback = state.projection.nodeFeedback.find(item => item.id === id);
+        if (!feedback || feedback.goalId !== goalId || feedback.status !== 'pending'
+          || !prepared.retiredNodes.some(item => item.nodeId === feedback.nodeId)) {
+          throw new FwaApplicationError('Feedback must be pending and bind an affected current Node.', 'feedback-revision-mismatch');
+        }
+      }
+      const revisionId = `${goal.planId}:revision:${prepared.revision}`;
+      const events = [];
+      const add = (type, streamId, streamVersion, payload) => {
+        const event = this.#event({ type, streamId, streamVersion, payload,
+          sequence: state.store.lastSequence + events.length + 1, commandId: normalizedCommandId,
+          ...(events[0] ? { causationId: events[0].eventId } : {}) });
+        events.push(event); return event;
+      };
+      const revised = add('PlanRevised', `goal:${goalId}`, goal.version + 1, {
+        goalId, planId: goal.planId, revisionId, expectedRevision, revision: prepared.revision,
+        plan: prepared.plan, bindings: prepared.bindings, retiredNodes: prepared.retiredNodes, reason, feedbackIds
+      });
+      for (const retired of prepared.retiredNodes) {
+        const node = state.projection.nodes.find(item => item.id === retired.nodeId);
+        add('NodeSuperseded', `node:${node.id}`, node.version + 1, { ...retired, goalId, revisionId });
+      }
+      for (const created of prepared.createdNodes) add('NodePlanned', `node:${created.node.id}`, 1, {
+        goalId, planId: goal.planId, ...created
+      });
+      const allNodes = [...state.projection.nodes, ...prepared.createdNodes.map(item => ({ ...item.node, status: 'planned', validity: 'valid' }))];
+      for (const { node } of prepared.createdNodes) {
+        const dependenciesReady = node.dependsOn.every(id => {
+          const dependency = allNodes.find(item => item.id === id);
+          return dependency?.status === 'accepted' && dependency.validity === 'valid'
+            && dependency.integrationStatus === 'integrated' && dependency.acceptedChangeSetId != null
+            && dependency.acceptedChangeSetId === dependency.integratedChangeSetId
+            && goal.integrationTargetRef != null && dependency.integratedTargetRef === goal.integrationTargetRef;
+        });
+        if (dependenciesReady) add('NodeReady', `node:${node.id}`, 2, { goalId, planId: goal.planId, nodeId: node.id, reason: 'dependencies-satisfied' });
+      }
+      const projection = projectEvents([...state.store.events, ...events]);
+      const write = await this.#withLockRetry(() => this.#appendBatch(normalizedCommandId, events, {
+        expectedLastSequence: state.store.lastSequence, intentHash
+      }));
+      return result(write.appended ? projection : (await this.#readState()).projection,
+        write.appended ? revised : eventFromBatch(write.batch, 'PlanRevised'), write.appended);
+    } finally {
+      await this.#leaseOperation(() => this.lease.release({ leaseId: reservation.lease.leaseId, ownerToken: reservation.ownerToken }));
+    }
+  }
+
   async getStatus() {
     const state = await this.#readState();
     return {
@@ -604,7 +741,9 @@ export class FwaApplication {
       evidence: state.projection.evidence ?? [],
       integrations: state.projection.integrations ?? [],
       reversions: state.projection.reversions ?? [],
-      projectRevisions: state.projection.projectRevisions ?? []
+      projectRevisions: state.projection.projectRevisions ?? [],
+      runBatches: state.projection.runBatches ?? [],
+      workflow: buildWorkflow(state.projection)
     };
   }
 
@@ -614,6 +753,14 @@ export class FwaApplication {
       ...options,
       artifacts: this.artifacts
     });
+  }
+
+  async runReadyBatch(options = {}) {
+    return this.runOrchestrator.runReadyBatch({ lease: this.lease, ...options, artifacts: this.artifacts });
+  }
+
+  async reconcileRunBatch(options = {}) {
+    return this.runOrchestrator.reconcileBatch({ lease: this.lease, ...options });
   }
 
   async retryNode({ nodeId, commandId, reason } = {}) {
@@ -1296,6 +1443,7 @@ export class FwaApplication {
     const activeRuns = state.projection.runs
       .filter((run) => ['pending', 'running', 'paused'].includes(run.status))
       .map((run) => run.id);
+    const activeRunBatches = (state.projection.runBatches ?? []).filter(batch => batch.status === 'running').map(batch => batch.id);
     const pendingWorkspaceCleanup = state.projection.runs
       .filter((run) => run.status === 'produced' && run.workspaceStatus !== 'removed')
       .map((run) => run.id);
@@ -1484,6 +1632,7 @@ export class FwaApplication {
     return {
       ok: true,
       operationallyClean: activeRuns.length === 0
+        && activeRunBatches.length === 0
         && !lease.held
         && pendingWorkspaceCleanup.length === 0
         && preservedWorkspaces.length === 0
@@ -1513,6 +1662,7 @@ export class FwaApplication {
       goalCount: state.projection.goals.length,
       nodeCount: state.projection.nodes.length,
       runCount: state.projection.runs.length,
+      runBatchCount: (state.projection.runBatches ?? []).length,
       changeSetCount: state.projection.changeSets.length,
       evaluationCount: (state.projection.evaluations ?? []).length,
       evidenceCount: (state.projection.evidence ?? []).length,
@@ -1530,6 +1680,7 @@ export class FwaApplication {
       referencedArtifactCount: referencedArtifactDigests.size,
       unreferencedArtifacts,
       activeRuns,
+      activeRunBatches,
       lease,
       pendingWorkspaceCleanup,
       preservedWorkspaces,

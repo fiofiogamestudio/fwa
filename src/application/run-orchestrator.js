@@ -17,7 +17,7 @@ import {
   RunStatus
 } from '../core/state-machines.js';
 import { hashCanonicalValue } from '../storage/file-event-store.js';
-import { isNodeSchedulable, isUnfencedGitProcessFailure } from '../core/scheduling.js';
+import { findParallelConflicts, isNodeSchedulable, isUnfencedGitProcessFailure } from '../core/scheduling.js';
 import { loadProject } from './project.js';
 import { projectEvents } from './projection.js';
 import { settleLeaseOperation } from './lease-operations.js';
@@ -192,6 +192,9 @@ function refContracts(projection) {
 }
 
 function assertNoActiveProjectOperation(projection) {
+  const batch = (projection.runBatches ?? []).find((item) => item.status === 'running');
+  if (batch) throw new RunOrchestrationError(`Run batch ${batch.id} is active.`,
+    'run-batch-active', { batchId: batch.id });
   const unfenced = projection.runs.find((run) => isUnfencedGitProcessFailure(run.failure));
   if (unfenced) {
     throw new RunOrchestrationError('A Git process may still be alive without a durable safety fence; manual recovery is required.',
@@ -243,6 +246,25 @@ function assertNoActiveProjectOperation(projection) {
   }
 }
 
+function terminationUnconfirmed(failure) {
+  return failure?.code?.includes('termination-unconfirmed') === true
+    || failure?.details?.terminationConfirmed === false
+    || failure?.details?.process?.terminationConfirmed === false;
+}
+
+function serializedPort(port, methods, before, failed) {
+  let tail = Promise.resolve();
+  return Object.fromEntries(methods.map((method) => [method, (...args) => {
+    const operation = tail.then(async () => {
+      before?.();
+      try { return await port[method](...args); }
+      catch (error) { failed?.(error); throw error; }
+    });
+    tail = operation.catch(() => {});
+    return operation;
+  }]));
+}
+
 function leaseIsOwnedByRun(leaseState, runId) {
   if (leaseState?.held !== true || leaseState.lease === null
     || typeof leaseState.lease !== 'object') {
@@ -269,6 +291,8 @@ function assertAttemptBudget(node) {
 }
 
 function selectReadyNode(projection, requestedNodeId) {
+  const hasPendingFeedback = (goalId) => (projection.nodeFeedback ?? [])
+    .some((feedback) => feedback.goalId === goalId && feedback.status === 'pending');
   let node;
   if (requestedNodeId !== undefined) {
     node = projection.nodes.find((candidate) => candidate.id === requestedNodeId);
@@ -277,6 +301,10 @@ function selectReadyNode(projection, requestedNodeId) {
         `Node ${requestedNodeId} does not exist.`,
         'node-not-found'
       );
+    }
+    if (hasPendingFeedback(node.goalId)) {
+      throw new RunOrchestrationError('Resolve pending node feedback before dispatching another leaf.',
+        'pending-node-feedback', { goalId: node.goalId, nodeId: node.id });
     }
     if (!isNodeSchedulable(node, projection.nodes,
       projection.goals.find((goal) => goal.id === node.goalId))) {
@@ -289,7 +317,7 @@ function selectReadyNode(projection, requestedNodeId) {
   } else {
     node = projection.nodes
       .filter((candidate) => (
-        isNodeSchedulable(candidate, projection.nodes,
+        !hasPendingFeedback(candidate.goalId) && isNodeSchedulable(candidate, projection.nodes,
           projection.goals.find((goal) => goal.id === candidate.goalId))
       ))
       .sort((left, right) => (
@@ -581,7 +609,262 @@ export class RunOrchestrator {
     this.lockRetryDelays = [...lockRetryDelays];
   }
 
-  async runNext({
+  async runNext(options = {}) {
+    return this.#runNext(options);
+  }
+
+  async runReadyBatch({ executions, executor, workspace, lease, artifacts,
+    baseRevision = 'HEAD', commandId, maxConcurrency = 4, signal, leaseTtlMs } = {}) {
+    assertPort(workspace, 'workspace', ['inspect', 'create', 'capture', 'remove']);
+    assertPort(lease, 'lease', ['init', 'inspect', 'acquire', 'heartbeat', 'release', 'archiveStale']);
+    assertPort(artifacts, 'artifacts', ['init', 'put', 'verify']);
+    if (!Array.isArray(executions) || executions.length < 1 || executions.length > 128
+      || !Number.isSafeInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 8) {
+      throw new RunOrchestrationError('executions must contain 1..128 unique nodes; maxConcurrency must be 1..8.', 'invalid-run-command');
+    }
+    const entries = executions.map((entry) => {
+      const selectedExecutor = entry.executor ?? executor;
+      assertExecutor(selectedExecutor);
+      return { nodeId: requireTrimmedString(entry.nodeId, 'nodeId'),
+        input: cloneJson(entry.input, 'input'), executor: selectedExecutor };
+    });
+    if (new Set(entries.map((entry) => entry.nodeId)).size !== entries.length) {
+      throw new RunOrchestrationError('Batch node IDs must be unique.', 'invalid-run-command');
+    }
+    const requestedBaseRevision = requireTrimmedString(baseRevision, 'baseRevision');
+    const normalizedCommandId = commandId === undefined ? this.#id('command') : requirePublicCommandId(commandId);
+    const ttlMs = requireSafeDuration(leaseTtlMs, 'leaseTtlMs', DEFAULT_LEASE_TTL_MS);
+    const intent = { schemaVersion: 1, type: 'RunReadyBatch', baseRevision: requestedBaseRevision,
+      maxConcurrency, executions: entries.map((entry) => ({ nodeId: entry.nodeId,
+        input: entry.input, executor: { id: entry.executor.id, version: entry.executor.version } })) };
+    let state = await this.#readState();
+    const existing = recordedBatch(state.store, normalizedCommandId, hashCanonicalValue(intent));
+    if (existing) {
+      const recordedId = eventFromBatch(existing, 'RunBatchStarted').payload.batchId;
+      const currentLease = await settleLeaseOperation(lease, () => lease.init());
+      return this.#batchResult(state, normalizedCommandId, recordedId, false, {
+        leaseReleased: !(currentLease.held && currentLease.lease.ownerKind === 'run-batch'
+          && currentLease.lease.ownerId === recordedId), warnings: []
+      });
+    }
+    assertNoActiveProjectOperation(state.projection);
+    const leaseState = await settleLeaseOperation(lease, () => lease.init());
+    if (leaseState.held) throw new RunOrchestrationError('The workspace is already leased.', 'workspace-lease-held', leaseState);
+    const batchId = this.#id('batch');
+    const acquired = await settleLeaseOperation(lease, () => lease.acquire({ ownerKind: 'run-batch', ownerId: batchId, ttlMs }));
+    const controller = new AbortController();
+    let unsafe = null;
+    const markUnsafe = (failure) => { unsafe ??= failure; controller.abort(new RunOrchestrationError(
+      'A batch process could not be confirmed stopped; preserve the operation for explicit recovery.',
+      'run-batch-recovery-required', { failure })); };
+    const externalAbort = () => controller.abort(signal.reason);
+    if (signal?.aborted) externalAbort();
+    else signal?.addEventListener('abort', externalAbort, { once: true });
+    const heartbeat = startHeartbeat(lease, acquired, ttlMs, controller.signal);
+    let persisted = false;
+    let finished = false;
+    const cleanup = { leaseReleased: false, warnings: [] };
+    try {
+      await artifacts.init();
+      const inspection = await workspace.inspect({ baseRevision: requestedBaseRevision });
+      if (inspection?.clean !== true || typeof inspection.baseRevision !== 'string'
+        || typeof inspection.coreIgnoreCase !== 'boolean') {
+        throw new RunOrchestrationError('Invalid batch workspace inspection.', 'invalid-workspace-result');
+      }
+      const runIds = new Map(entries.map((entry) => [entry.nodeId, this.#id('run')]));
+      const initial = await this.#appendDerived({ commandId: normalizedCommandId,
+        correlationId: normalizedCommandId, intent, build: (latest) => {
+          assertNoActiveProjectOperation(latest.projection);
+          const sorted = [...entries].sort((a, b) => {
+            const x = latest.projection.nodes.find((node) => node.id === a.nodeId);
+            const y = latest.projection.nodes.find((node) => node.id === b.nodeId);
+            return (x?.readySequence ?? Infinity) - (y?.readySequence ?? Infinity)
+              || a.nodeId.localeCompare(b.nodeId);
+          });
+          const selected = [];
+          const deferred = [];
+          for (const entry of sorted) {
+            let node;
+            try { node = selectReadyNode(latest.projection, entry.nodeId); }
+            catch (error) { deferred.push({ nodeId: entry.nodeId, code: error.code }); continue; }
+            if (!executorProvidesCapabilities(entry.executor, node.capabilities)) {
+              deferred.push({ nodeId: node.id, code: 'executor-capability-mismatch' }); continue;
+            }
+            const effects = resolveNodeEffects(node, refContracts(latest.projection));
+            normalizeWritePatterns(effects.writes, { ignoreCase: inspection.coreIgnoreCase });
+            const candidate = { nodeId: node.id, reads: effects.reads, writes: effects.writes,
+              resources: node.resources ?? [] };
+            const conflicts = findParallelConflicts([...selected.map((item) => item.candidate), candidate],
+              { ignoreCase: inspection.coreIgnoreCase });
+            if (conflicts.length) {
+              deferred.push({ nodeId: node.id, code: 'parallel-effect-conflict', conflicts }); continue;
+            }
+            if (selected.length >= maxConcurrency) {
+              deferred.push({ nodeId: node.id, code: 'batch-capacity' }); continue;
+            }
+            selected.push({ entry, node, effects, candidate });
+          }
+          if (!selected.length) throw new RunOrchestrationError('No requested node is currently runnable.',
+            'no-ready-nodes', { deferred });
+          const members = selected.map(({ entry, node }) => ({ runId: runIds.get(node.id), nodeId: node.id,
+            executor: { id: entry.executor.id, version: entry.executor.version },
+            inputHash: `sha256:${hashCanonicalValue(entry.input)}`, resources: [...(node.resources ?? [])] }));
+          return [{ type: 'RunBatchStarted', streamId: `run-batch:${batchId}`, payload: {
+            batchId, leaseId: acquired.lease.leaseId, baseRevision: inspection.baseRevision,
+            coreIgnoreCase: inspection.coreIgnoreCase, members, deferred
+          } }, ...selected.map(({ entry, node, effects }, index) => ({
+            type: 'RunCreated', streamId: `run:${members[index].runId}`, payload: {
+              runId: members[index].runId, batchId, nodeId: node.id, goalId: node.goalId, planId: node.planId,
+              executor: members[index].executor, requestedBaseRevision, baseRevision: inspection.baseRevision,
+              inputHash: members[index].inputHash, workspaceRelativePath: `.fwa/worktrees/${members[index].runId}`,
+              effects: { logicalReads: [...node.reads], logicalWrites: [...node.writes],
+                resolvedReads: [...effects.reads], resolvedWrites: [...effects.writes],
+                consumedRefs: effects.consumedRefs.map((ref) => ({ ...ref })),
+                producedRefs: effects.producedRefs.map((ref) => ({ ...ref })) }
+            }
+          }))];
+        } });
+      if (!initial.appended) return this.#batchResult(initial.state, normalizedCommandId,
+        eventFromBatch(initial.batch, 'RunBatchStarted').payload.batchId, false);
+      persisted = true;
+      const members = eventFromBatch(initial.batch, 'RunBatchStarted').payload.members;
+      const gitPort = serializedPort(workspace, ['inspect', 'create', 'capture', 'remove'], () => {
+        if (unsafe) throw new RunOrchestrationError('Batch workspace is fenced until explicit recovery.',
+          'run-batch-recovery-required', { failure: unsafe });
+      }, (error) => { if (terminationUnconfirmed(failureFrom(error))) markUnsafe(failureFrom(error)); });
+      const artifactPort = serializedPort(artifacts, ['init', 'put', 'verify']);
+      // The coordinator alone heartbeats the real shared capability. Member
+      // heartbeat controllers still enforce their independent deadlines/signals.
+      const memberLease = Object.fromEntries(['init', 'inspect', 'acquire', 'release', 'archiveStale']
+        .map((method) => [method, (...args) => lease[method](...args)]));
+      memberLease.heartbeat = async () => {};
+      const outcomes = await Promise.allSettled(members.map((member) => {
+        const entry = entries.find((item) => item.nodeId === member.nodeId);
+        return this.#runNext({ executor: entry.executor, workspace: gitPort, lease: memberLease,
+          artifacts: artifactPort, input: entry.input, baseRevision: requestedBaseRevision,
+          nodeId: member.nodeId, commandId: `${normalizedCommandId}/${member.runId}`,
+          signal: heartbeat.signal, leaseTtlMs: ttlMs },
+        { batchId, runId: member.runId, acquired, inspection, markUnsafe });
+      }));
+      for (let i = 0; i < outcomes.length; i += 1) {
+        if (outcomes[i].status === 'rejected') cleanup.warnings.push({ runId: members[i].runId,
+          phase: 'member', failure: failureFrom(outcomes[i].reason) });
+      }
+      state = await this.#readState();
+      if (!unsafe && members.every((member) => {
+        const run = state.projection.runs.find((item) => item.id === member.runId);
+        return run && !isActiveRun(run);
+      })) {
+        await this.#finishBatch(batchId, normalizedCommandId, 'completed', null);
+        finished = true;
+      }
+      return this.#batchResult(await this.#readState(), normalizedCommandId, batchId, true, cleanup);
+    } finally {
+      signal?.removeEventListener('abort', externalAbort);
+      try { await heartbeat.stop(); }
+      catch (error) { cleanup.warnings.push({ phase: 'heartbeat-stop', failure: failureFrom(error) }); }
+      // A persisted unfinished batch is a durable operational fence, even when
+      // every Run is terminal. Never release its lease as ordinary cleanup.
+      if (!persisted || finished) {
+        try { await settleLeaseOperation(lease, () => lease.release({
+          leaseId: acquired.lease.leaseId, ownerToken: acquired.ownerToken
+        })); cleanup.leaseReleased = true; }
+        catch (error) { cleanup.warnings.push({ phase: 'lease-release', failure: failureFrom(error) }); }
+      }
+    }
+  }
+
+  async #finishBatch(batchId, correlationId, outcome, reason) {
+    return this.#appendDerived({ commandId: this.#internalCommand(batchId, `finished-${outcome}`),
+      correlationId, intent: { type: 'FinishRunBatch', batchId, outcome, reason },
+      build: () => [{ type: 'RunBatchFinished', streamId: `run-batch:${batchId}`,
+        payload: { batchId, outcome, reason } }] });
+  }
+
+  #batchResult(state, commandId, batchId, appended, cleanup = { leaseReleased: false, warnings: [] }) {
+    const batch = state.projection.runBatches.find((item) => item.id === batchId);
+    const members = batch.members.map((member) => {
+      const run = state.projection.runs.find((item) => item.id === member.runId);
+      return { nodeId: member.nodeId, runId: member.runId, run,
+        changeSet: state.projection.changeSets.find((item) => item.id === run?.changeSetId) ?? null,
+        ok: run?.status === RunStatus.PRODUCED,
+        cleanup: { worktreeRemoved: run?.workspaceStatus === 'removed' } };
+    });
+    return { ok: batch.status === 'finished' && members.every((item) => item.ok),
+      appended, commandId, batch, members, deferred: batch.deferred ?? [], cleanup };
+  }
+
+  async reconcileBatch({ lease, batchId, correlationId, confirmProcessesStopped = false,
+    orphanGraceMs = DEFAULT_ORPHAN_GRACE_MS } = {}) {
+    assertPort(lease, 'lease', ['init', 'inspect', 'acquire', 'release', 'archiveStale']);
+    const graceMs = requireSafeDuration(orphanGraceMs, 'orphanGraceMs', DEFAULT_ORPHAN_GRACE_MS);
+    const requestedId = batchId === undefined ? null : requireTrimmedString(batchId, 'batchId');
+    const commandId = correlationId === undefined ? this.#id('command') : requirePublicCommandId(correlationId);
+    const state = await this.#readState();
+    const batch = state.projection.runBatches?.find((item) => requestedId ? item.id === requestedId : item.status === 'running');
+    let leaseState = await settleLeaseOperation(lease, () => lease.init());
+    if (!batch) {
+      // Acquire precedes the atomic manifest publication. A crash in that small
+      // window has no member Runs, but still needs a dead-owner, explicit reset.
+      if (!leaseState.held || leaseState.lease.ownerKind !== 'run-batch'
+        || (requestedId && leaseState.lease.ownerId !== requestedId)) {
+        return { ok: true, reconciled: false, reason: 'no-active-run-batch' };
+      }
+      if (!leaseState.stale) return { ok: false, reconciled: false, reason: 'batch-owner-not-dead', lease: leaseState };
+      if (confirmProcessesStopped !== true) return { ok: false, reconciled: false, reason: 'process-stop-confirmation-required', lease: leaseState };
+      const archived = await settleLeaseOperation(lease, () => lease.archiveStale({
+        expectedLeaseId: leaseState.lease.leaseId
+      }));
+      return { ok: true, reconciled: true, reason: 'orphan-batch-lease-archived', archived, cleanupResults: [] };
+    }
+    if (leaseState.held) {
+      if (leaseState.lease.ownerKind !== 'run-batch' || leaseState.lease.ownerId !== batch.id) {
+        return { ok: false, reconciled: false, reason: 'another-operation-owns-lease', batch, lease: leaseState };
+      }
+      if (!leaseState.stale) return { ok: false, reconciled: false,
+        reason: 'batch-owner-not-dead', batch, lease: leaseState };
+    } else if (batch.status === 'running') {
+      const ageMs = this.#now().getTime() - Date.parse(batch.createdAt);
+      if (!Number.isFinite(ageMs) || ageMs < graceMs) return { ok: false, reconciled: false,
+        reason: 'batch-without-lease-within-grace-period', batch };
+    }
+    // Dead coordinator does not prove executor descendants are gone. This is
+    // an explicit operator assertion, not automatic PID/TTL inference.
+    if (confirmProcessesStopped !== true) return { ok: false, reconciled: false,
+      reason: 'process-stop-confirmation-required', batch };
+    if (leaseState.held) await settleLeaseOperation(lease, () => lease.archiveStale({
+      expectedLeaseId: leaseState.lease.leaseId
+    }));
+    const acquired = await settleLeaseOperation(lease, () => lease.acquire({
+      ownerKind: 'run-batch', ownerId: batch.id
+    }));
+    let finished = batch.status === 'finished';
+    try {
+      for (const member of batch.members) {
+        const latest = await this.#readState();
+        const run = latest.projection.runs.find((item) => item.id === member.runId);
+        if (!run || !isActiveRun(run)) continue;
+        const failure = { code: 'RUN_OWNER_LOST', message: 'Batch coordinator was lost; operator confirmed descendant processes stopped.',
+          details: { batchId: batch.id, confirmProcessesStopped: true, workspacePreserved: true } };
+        const record = run.status === RunStatus.PENDING
+          ? this.#recordPendingFailure.bind(this) : this.#recordRunningFailure.bind(this);
+        await record({ runId: run.id, commandId: this.#internalCommand(run.id, 'batch-owner-lost'),
+          correlationId: commandId, phase: 'reconciliation', failure });
+      }
+      if (!finished) await this.#finishBatch(batch.id, commandId, 'reconciled',
+        'Coordinator is dead and operator confirmed processes stopped; workspaces and Git fences were preserved.');
+      finished = true;
+      return { ok: true, reconciled: true, reason: 'run-batch-reconciled',
+        batch: (await this.#readState()).projection.runBatches.find((item) => item.id === batch.id),
+        cleanupResults: [] };
+    } finally {
+      if (finished) await settleLeaseOperation(lease, () => lease.release({
+        leaseId: acquired.lease.leaseId, ownerToken: acquired.ownerToken
+      }));
+    }
+  }
+
+  async #runNext({
     executor,
     workspace,
     lease,
@@ -592,7 +875,7 @@ export class RunOrchestrator {
     commandId,
     signal,
     leaseTtlMs
-  } = {}) {
+  } = {}, batchContext = null) {
     assertExecutor(executor);
     assertPort(workspace, 'workspace', ['inspect', 'create', 'capture', 'remove']);
     assertPort(lease, 'lease', [
@@ -619,13 +902,15 @@ export class RunOrchestrator {
     const overallIntentHash = hashCanonicalValue(overallIntent);
 
     let state = await this.#readState();
-    const existing = recordedBatch(state.store, normalizedCommandId, overallIntentHash);
+    const existing = batchContext ? null : recordedBatch(state.store, normalizedCommandId, overallIntentHash);
     if (existing) {
       const runId = eventFromBatch(existing, 'RunCreated').payload.runId;
       return await this.#existingRunResult(state, normalizedCommandId, runId, lease);
     }
-    assertNoActiveProjectOperation(state.projection);
-    const selectedNode = selectReadyNode(state.projection, requestedNodeId);
+    if (!batchContext) assertNoActiveProjectOperation(state.projection);
+    const selectedNode = batchContext
+      ? state.projection.nodes.find((node) => node.id === requestedNodeId)
+      : selectReadyNode(state.projection, requestedNodeId);
     const selectedEffects = resolveNodeEffects(
       selectedNode,
       refContracts(state.projection)
@@ -641,9 +926,9 @@ export class RunOrchestrator {
       );
     }
 
-    const leaseState = await settleLeaseOperation(lease, () => lease.init());
-    await artifacts.init();
-    if (leaseState.held) {
+    const leaseState = batchContext ? null : await settleLeaseOperation(lease, () => lease.init());
+    if (!batchContext) await artifacts.init();
+    if (leaseState?.held) {
       throw new RunOrchestrationError(
         'The workspace is already leased; inspect or reconcile it before running.',
         'workspace-lease-held',
@@ -651,7 +936,8 @@ export class RunOrchestrator {
       );
     }
 
-    const inspection = await workspace.inspect({ baseRevision: requestedBaseRevision });
+    const inspection = batchContext?.inspection
+      ?? await workspace.inspect({ baseRevision: requestedBaseRevision });
     if (inspection?.clean !== true
       || typeof inspection.baseRevision !== 'string'
       || typeof inspection.coreIgnoreCase !== 'boolean') {
@@ -665,7 +951,7 @@ export class RunOrchestrator {
       path: 'node.writes'
     });
 
-    const runId = this.#id('run');
+    const runId = batchContext?.runId ?? this.#id('run');
     const workspaceRelativePath = `.fwa/worktrees/${runId}`;
     let persistedRunId = null;
     let ownsPersistedRun = false;
@@ -677,6 +963,18 @@ export class RunOrchestrator {
 
     try {
       try {
+        if (batchContext) {
+          const batch = state.projection.runBatches.find((item) => item.id === batchContext.batchId);
+          const member = state.projection.runs.find((item) => item.id === runId);
+          if (batch?.status !== 'running' || member?.batchId !== batch.id
+            || member.status !== RunStatus.PENDING
+            || batch.leaseId !== batchContext.acquired.lease.leaseId) {
+            throw new RunOrchestrationError('Batch member no longer owns its operation.', 'run-batch-mismatch');
+          }
+          acquired = batchContext.acquired;
+          persistedRunId = runId;
+          ownsPersistedRun = true;
+        } else {
         acquired = await settleLeaseOperation(
           lease,
           () => lease.acquire({ runId, ttlMs })
@@ -781,6 +1079,7 @@ export class RunOrchestrator {
           return { ...replay, cleanup };
         }
         ownsPersistedRun = true;
+        }
 
         workspaceInfo = await workspace.create({
           runId: persistedRunId,
@@ -897,7 +1196,7 @@ export class RunOrchestrator {
       let executorResult = null;
       let executionFailure = null;
       try {
-        executorResult = validateExecutorResult(await executor.execute({
+        const rawResult = await executor.execute({
           workspaceRoot: workspaceInfo.workspacePath,
           node: {
             ...runningNode,
@@ -909,7 +1208,12 @@ export class RunOrchestrator {
           baseRevision: runningRun.baseRevision,
           input: normalizedInput,
           signal: heartbeat.signal
-        }));
+        });
+        if (batchContext && rawResult?.process?.terminationConfirmed === false) {
+          throw new RunOrchestrationError('Executor reported an unconfirmed process despite returning a result.',
+            'executor-termination-unconfirmed', { process: optionalJson(rawResult.process) });
+        }
+        executorResult = validateExecutorResult(rawResult);
       } catch (error) {
         executionFailure = failureFrom(error, 'EXECUTOR_FAILED');
       }
@@ -925,6 +1229,19 @@ export class RunOrchestrator {
         executionFailure ??= failureFrom(error, 'LEASE_HEARTBEAT_FAILED');
       }
       heartbeat = null;
+
+      if (batchContext && terminationUnconfirmed(executionFailure)) {
+        batchContext.markUnsafe(executionFailure);
+        await this.#recordRunningFailure({
+          runId: persistedRunId,
+          commandId: this.#internalCommand(persistedRunId, 'termination-unconfirmed'),
+          correlationId: normalizedCommandId,
+          phase: 'execution',
+          failure: executionFailure
+        });
+        cleanup.preservedWorkspace = workspaceInfo.workspacePath;
+        return await this.#runResult(normalizedCommandId, persistedRunId, true, cleanup);
+      }
 
       let capture;
       try {
@@ -1132,7 +1449,7 @@ export class RunOrchestrator {
           cleanup.warnings.push({ phase: 'heartbeat-stop', failure: failureFrom(error) });
         }
       }
-      if (acquired) {
+      if (acquired && !batchContext) {
         try {
           await settleLeaseOperation(lease, () => lease.release({
             leaseId: acquired.lease.leaseId,
@@ -1161,6 +1478,9 @@ export class RunOrchestrator {
     const graceMs = requireSafeDuration(orphanGraceMs, 'orphanGraceMs', DEFAULT_ORPHAN_GRACE_MS);
     const leaseState = await settleLeaseOperation(lease, () => lease.init());
     let state = await this.#readState();
+    const activeBatch = (state.projection.runBatches ?? []).find((item) => item.status === 'running');
+    if (activeBatch) return { ok: false, reconciled: false,
+      reason: 'run-batch-reconciliation-required', batch: activeBatch, cleanupResults: [] };
     const unfenced = state.projection.runs.find((run) => isUnfencedGitProcessFailure(run.failure));
     if (unfenced) {
       return { ok: false, reconciled: false, reason: 'git-process-manual-recovery-required',

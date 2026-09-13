@@ -353,7 +353,8 @@ function normalizeInput(input, defaultModel) {
     'prompt',
     'model',
     'ignoreUserConfig',
-    'windowsSandboxOverride'
+    'windowsSandboxOverride',
+    'images'
   ]);
   const unknown = Object.keys(input).filter((field) => !allowed.has(field));
   if (unknown.length > 0) {
@@ -396,12 +397,17 @@ function normalizeInput(input, defaultModel) {
     );
   }
   const windowsSandboxOverride = input.windowsSandboxOverride ?? null;
+  const images = input.images ?? [];
+  if (!Array.isArray(images) || images.length > 16 || images.some(item => typeof item !== 'string' || !path.isAbsolute(item) || item.includes('\0'))) {
+    throw new CodexExecutorError('FWA_INVALID_CODEX_EXECUTOR_INPUT', 'images must contain at most 16 explicit absolute image paths.');
+  }
   return {
     prompt,
     promptBytes,
     model,
     ignoreUserConfig,
-    windowsSandboxOverride
+    windowsSandboxOverride,
+    images: [...images]
   };
 }
 
@@ -868,6 +874,8 @@ export class CodexExecutor {
   #spawn;
   #terminationGraceMs;
   #timeoutMs;
+  #sandbox;
+  #outputSchema;
 
   constructor(options = {}) {
     if (!isPlainObject(options)) {
@@ -897,6 +905,14 @@ export class CodexExecutor {
     this.#defaultModel = options.model === undefined
       ? null
       : requireString(options.model, 'model', 'FWA_INVALID_CODEX_EXECUTOR_OPTIONS');
+    this.#sandbox = options.sandbox ?? 'workspace-write';
+    if (!['read-only', 'workspace-write'].includes(this.#sandbox)) {
+      throw new CodexExecutorError('FWA_INVALID_CODEX_EXECUTOR_OPTIONS', 'sandbox must be read-only or workspace-write.');
+    }
+    this.#outputSchema = options.outputSchema ?? null;
+    if (this.#outputSchema !== null && (typeof this.#outputSchema !== 'string' || !path.isAbsolute(this.#outputSchema))) {
+      throw new CodexExecutorError('FWA_INVALID_CODEX_EXECUTOR_OPTIONS', 'outputSchema must be an absolute, server-selected file path.');
+    }
     this.#timeoutMs = requireDuration(
       options.timeoutMs ?? DEFAULT_CODEX_TIMEOUT_MS,
       'timeoutMs',
@@ -935,6 +951,15 @@ export class CodexExecutor {
       );
     }
     const normalized = normalizeInput(input, this.#defaultModel);
+    for (const imagePath of normalized.images) {
+      const info = await lstat(imagePath);
+      if (!info.isFile() || info.isSymbolicLink() || info.size > 16 * 1024 * 1024) {
+        throw new CodexExecutorError('FWA_INVALID_CODEX_EXECUTOR_INPUT', 'Image inputs must be bounded regular files, not links.');
+      }
+    }
+    if (this.#sandbox === 'read-only' && normalized.windowsSandboxOverride !== null) {
+      throw new CodexExecutorError('FWA_INVALID_CODEX_EXECUTOR_INPUT', 'Read-only planning cannot override the Windows sandbox.');
+    }
     if (normalized.windowsSandboxOverride !== null && this.#platform !== 'win32') {
       throw new CodexExecutorError(
         'FWA_INVALID_CODEX_EXECUTOR_INPUT',
@@ -956,7 +981,9 @@ export class CodexExecutor {
       ...(normalized.windowsSandboxOverride === 'elevated'
         ? ['-c', WINDOWS_ELEVATED_SANDBOX_OVERRIDE]
         : []),
-      '--full-auto',
+      '--sandbox', this.#sandbox,
+      ...(this.#outputSchema === null ? [] : ['--output-schema', this.#outputSchema]),
+      ...normalized.images.flatMap(imagePath => ['--image', imagePath]),
       '--cd',
       root,
       ...(normalized.model === null ? [] : ['--model', normalized.model]),
@@ -974,7 +1001,7 @@ export class CodexExecutor {
       windowsSandboxOverride: normalized.windowsSandboxOverride,
       sandbox: normalized.windowsSandboxOverride === 'elevated'
         ? 'windows-elevated'
-        : 'workspace-write-requested',
+        : `${this.#sandbox}-requested`,
       model: normalized.model,
       promptBytes: normalized.promptBytes,
       promptSha256: createHash('sha256').update(normalized.prompt).digest('hex'),

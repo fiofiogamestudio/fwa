@@ -282,7 +282,7 @@ export function validatePlan(plan, options = {}) {
 
   validateKnownFields(
     plan,
-    ['schemaVersion', 'id', 'goalId', 'goal_id', 'nodes'],
+    ['schemaVersion', 'id', 'goalId', 'goal_id', 'groups', 'nodes'],
     '$',
     errors
   );
@@ -337,7 +337,7 @@ export function validatePlan(plan, options = {}) {
     }
 
     validateKnownFields(node, [
-      'id', 'title',
+      'id', 'title', 'parentId', 'resources', 'instruction', 'referenceInputs',
       ...aliases.dependsOn,
       'reads', 'writes',
       ...aliases.capabilities,
@@ -388,6 +388,27 @@ export function validatePlan(plan, options = {}) {
 
     validateStringList(node.reads, `${path}.reads`, errors);
     validateStringList(node.writes, `${path}.writes`, errors);
+    if (node.resources !== undefined) validateStringList(node.resources, `${path}.resources`, errors);
+    if (node.instruction !== undefined) validateIdentifier(node.instruction, `${path}.instruction`, errors);
+    if (node.referenceInputs !== undefined) {
+      if (!Array.isArray(node.referenceInputs)) addError(errors, 'INVALID_REFERENCE_INPUTS', `${path}.referenceInputs`, 'Expected snapshot descriptors.');
+      else {
+        const snapshots = new Set();
+        for (const [inputIndex, input] of node.referenceInputs.entries()) {
+          const inputPath = `${path}.referenceInputs[${inputIndex}]`;
+          if (!isPlainObject(input)) { addError(errors, 'INVALID_REFERENCE_INPUT', inputPath, 'Expected a snapshot descriptor.'); continue; }
+          validateKnownFields(input, ['libraryId', 'versionId', 'manifestHash'], inputPath, errors);
+          validateIdentifier(input.libraryId, `${inputPath}.libraryId`, errors);
+          validateIdentifier(input.versionId, `${inputPath}.versionId`, errors);
+          if (typeof input.manifestHash !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(input.manifestHash)) {
+            addError(errors, 'INVALID_REFERENCE_HASH', `${inputPath}.manifestHash`, 'Expected a SHA-256 manifest hash.');
+          }
+          const key = JSON.stringify([input.libraryId, input.versionId]);
+          if (snapshots.has(key)) addError(errors, 'DUPLICATE_REFERENCE_INPUT', inputPath, 'Duplicate library snapshot.');
+          snapshots.add(key);
+        }
+      }
+    }
 
     const capabilities = aliasedValue(
       node,
@@ -455,6 +476,49 @@ export function validatePlan(plan, options = {}) {
       `Dependency cycle detected: ${cycle.join(' -> ')}.`,
       { cycle }
     );
+  }
+
+  // Decomposition is a separate forest. Only plan.nodes are executable leaves;
+  // a parent group can neither declare effects nor become a DAG prerequisite.
+  const groupsById = new Map();
+  if (plan.groups !== undefined && !Array.isArray(plan.groups)) {
+    addError(errors, 'INVALID_GROUPS', 'groups', 'Expected a group array.');
+  }
+  for (const [index, group] of (Array.isArray(plan.groups) ? plan.groups : []).entries()) {
+    const groupPath = `groups[${index}]`;
+    if (!isPlainObject(group)) {
+      addError(errors, 'INVALID_GROUP', groupPath, 'Expected a group object.');
+      continue;
+    }
+    validateKnownFields(group, ['id', 'title', 'parentId'], groupPath, errors);
+    if (validateIdentifier(group.id, `${groupPath}.id`, errors)) {
+      if (groupsById.has(group.id) || nodesById.has(group.id)) {
+        addError(errors, 'DUPLICATE_GROUP_ID', `${groupPath}.id`, 'Group and leaf ids must be distinct.');
+      } else groupsById.set(group.id, group);
+    }
+    validateIdentifier(group.title, `${groupPath}.title`, errors);
+  }
+  const parentsById = new Map();
+  for (const [id, item] of [...groupsById, ...nodesById]) {
+    const parentId = item.parentId;
+    if (parentId === undefined || parentId === null) {
+      if (groupsById.has(id)) parentsById.set(id, []);
+      continue;
+    }
+    if (!validateIdentifier(parentId, `${id}.parentId`, errors)) continue;
+    if (!groupsById.has(parentId)) {
+      addError(errors, 'MISSING_PARENT_GROUP', `${id}.parentId`, 'A parent must name a group, not an executable leaf.');
+    } else if (parentId === id) {
+      addError(errors, 'HIERARCHY_CYCLE', `${id}.parentId`, 'A group cannot contain itself.');
+    }
+    if (groupsById.has(id)) parentsById.set(id, [parentId]);
+  }
+  const hierarchyCycle = findCycle([...groupsById.keys()], parentsById);
+  if (hierarchyCycle) addError(errors, 'HIERARCHY_CYCLE', 'groups', 'Decomposition must be acyclic.', { cycle: hierarchyCycle });
+  for (const id of groupsById.keys()) {
+    if (![...groupsById.values(), ...nodesById.values()].some(item => item.parentId === id)) {
+      addError(errors, 'EMPTY_GROUP', `group:${id}`, 'A group must contain a group or executable leaf.');
+    }
   }
 
   return Object.freeze({

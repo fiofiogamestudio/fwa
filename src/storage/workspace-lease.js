@@ -17,6 +17,7 @@ export const WORKSPACE_LEASE_SCHEMA_VERSION = 2;
 const LEGACY_WORKSPACE_LEASE_SCHEMA_VERSION = 1;
 const WORKSPACE_OWNER_KINDS = Object.freeze([
   'run',
+  'run-batch',
   'evaluation',
   'integration',
   'reversion'
@@ -42,7 +43,8 @@ export class WorkspaceLeaseError extends Error {
 }
 
 /**
- * A fail-closed, single-executor lease for one FWA project workspace.
+ * A fail-closed exclusive operation lease for one FWA project workspace.
+ * A run-batch coordinator owns one lease throughout all of its isolated Runs.
  *
  * Mutations are serialized by a short-lived guard file. The canonical guard is
  * published only after a complete temporary record is fsynced, and a guard is
