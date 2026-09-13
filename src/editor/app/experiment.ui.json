@@ -1,0 +1,273 @@
+{
+  "templates": {
+    "experiment": {
+      "type": "details",
+      "testId": "fwa-experiment",
+      "children": [
+        {
+          "type": "summary",
+          "text": "对比效果：保留 / 排除此项"
+        },
+        {
+          "type": "text",
+          "ref": "message",
+          "attrs": {
+            "role": "status"
+          }
+        },
+        {
+          "type": "stack",
+          "ref": "result"
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "blockersText"
+          },
+          "tone": "warning",
+          "visible": {
+            "$path": "blockersText"
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "reason"
+          },
+          "visible": {
+            "$path": "reason"
+          }
+        },
+        {
+          "type": "toolbar",
+          "children": [
+            {
+              "type": "button",
+              "text": "生成对照",
+              "testId": "fwa-experiment-run",
+              "attrs": {
+                "disabled": {
+                  "$path": "disabled"
+                }
+              },
+              "on": {
+                "click": "run"
+              }
+            },
+            {
+              "type": "button",
+              "text": "刷新结果",
+              "on": {
+                "click": "refresh"
+              }
+            }
+          ]
+        },
+        {
+          "type": "details",
+          "children": [
+            {
+              "type": "summary",
+              "text": "对照设置"
+            },
+            {
+              "type": "text",
+              "text": {
+                "$path": "conditionsText"
+              }
+            },
+            {
+              "type": "text",
+              "text": "两侧使用同一配置。效果由你判断。",
+              "tone": "muted"
+            }
+          ]
+        },
+        {
+          "type": "details",
+          "children": [
+            {
+              "type": "summary",
+              "text": "历史实验"
+            },
+            {
+              "type": "stack",
+              "ref": "history"
+            }
+          ]
+        }
+      ]
+    },
+    "history": {
+      "type": "button",
+      "text": {
+        "$path": "label"
+      },
+      "on": {
+        "click": "select"
+      }
+    },
+    "result": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "heading",
+          "text": {
+            "$path": "title"
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "summary"
+          },
+          "visible": {
+            "$path": "showReason"
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "files"
+          },
+          "visible": {
+            "$path": "files"
+          }
+        },
+        {
+          "type": "columns",
+          "columns": 2,
+          "preset": "comparison",
+          "children": [
+            {
+              "type": "card",
+              "ref": "a"
+            },
+            {
+              "type": "card",
+              "ref": "b"
+            }
+          ]
+        },
+        {
+          "type": "details",
+          "children": [
+            {
+              "type": "summary",
+              "text": "两个版本的代码差异"
+            },
+            {
+              "type": "pre",
+              "text": {
+                "$path": "patch"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "side": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "heading",
+          "text": {
+            "$path": "label"
+          }
+        },
+        {
+          "type": "list",
+          "items": {
+            "$path": "media"
+          },
+          "template": "media"
+        },
+        {
+          "type": "list",
+          "items": {
+            "$path": "checks"
+          },
+          "template": "check"
+        },
+        {
+          "type": "details",
+          "children": [
+            {
+              "type": "summary",
+              "text": "版本与工作区"
+            },
+            {
+              "type": "text",
+              "text": {
+                "$path": "revision"
+              },
+              "tone": "muted"
+            },
+            {
+              "type": "text",
+              "text": {
+                "$path": "location"
+              },
+              "tone": "muted"
+            }
+          ]
+        }
+      ]
+    },
+    "check": {
+      "type": "fieldset",
+      "children": [
+        {
+          "type": "text",
+          "text": {
+            "$path": "label"
+          }
+        },
+        {
+          "type": "pre",
+          "text": {
+            "$path": "summary"
+          }
+        },
+        {
+          "type": "details",
+          "children": [
+            {
+              "type": "summary",
+              "text": "完整输出"
+            },
+            {
+              "type": "pre",
+              "text": {
+                "$path": "output"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "media": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "image",
+          "preset": "image",
+          "attrs": {
+            "src": {
+              "$path": "src"
+            },
+            "alt": {
+              "$path": "path"
+            }
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "path"
+          }
+        }
+      ]
+    }
+  }
+}

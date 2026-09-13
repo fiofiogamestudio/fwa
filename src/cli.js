@@ -1,4 +1,5 @@
-import { readFile } from 'node:fs/promises';
+import { lstat, readFile } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import path from 'node:path';
 
 import { CommandEvaluator } from './adapters/command-evaluator.js';
@@ -33,7 +34,7 @@ Usage:
   fwa status [--project <path>] [--json]
   fwa events [--project <path>] [--json]
   fwa verify [--project <path>] [--json]
-  fwa editor --fwe-path <absolute FWE root> [--project <path>] [--port <port>] [--allow-write] [--json]
+  fwa editor --fwe-path <absolute FWE root> [--project <path>] [--port <port>] [--allow-write] [--codex-path <absolute native executable>] [--review-config <trusted JSON>] [--json]
   fwa help
 
 The target must be a Git worktree whose ignore rules exclude .fwa/**. Runtime
@@ -61,6 +62,8 @@ function parseArguments(argv) {
   const valuedOptions = new Map([
     ['--project', 'project'],
     ['--fwe-path', 'fwePath'],
+    ['--codex-path', 'codexPath'],
+    ['--review-config', 'reviewConfig'],
     ['--port', 'port'],
     ['--request', 'request'],
     ['--reason', 'reason'],
@@ -129,6 +132,31 @@ function rejectOptions(options, allowed) {
     throw new CliUsageError(
       `Option(s) not valid for this command: ${unexpected.map((key) => `--${key}`).join(', ')}.`
     );
+  }
+}
+
+async function nativeCodexPath(value) {
+  if (typeof value !== 'string' || value !== value.trim() || !path.isAbsolute(value)
+    || (process.platform === 'win32' && ['\\', '/'].includes(path.parse(value).root))
+    || /\.(?:cmd|bat)$/iu.test(value)
+    || (process.platform === 'win32' && path.extname(value).toLowerCase() !== '.exe')) {
+    throw new CliUsageError('--codex-path must be a fully qualified native executable path (not a .cmd/.bat wrapper).', 'invalid-codex-path');
+  }
+  const absolute = path.resolve(value);
+  let cursor = path.parse(absolute).root;
+  const parts = absolute.slice(cursor.length).split(path.sep).filter(Boolean);
+  try {
+    for (let index = 0; index < parts.length; index += 1) {
+      cursor = path.join(cursor, parts[index]);
+      const stats = await lstat(cursor);
+      if (stats.isSymbolicLink() || (index === parts.length - 1 ? !stats.isFile() : !stats.isDirectory())) {
+        throw new Error('Path must not traverse symbolic links or junctions and must end in a regular file.');
+      }
+    }
+    if (!parts.length) throw new Error('A directory is not an executable.');
+    return realpathSync.native(absolute);
+  } catch (error) {
+    throw new CliUsageError(`Invalid --codex-path: ${error.message}`, 'invalid-codex-path');
   }
 }
 
@@ -297,19 +325,23 @@ export async function runCli(argv, io = {}) {
     let result;
 
     if (positionals[0] === 'editor') {
-      requireShape(positionals, ['editor'], 'fwa editor --fwe-path <absolute path> [--project <path>] [--port <port>] [--allow-write]');
-      rejectOptions(options, ['project', 'fwePath', 'port', 'allowWrite']);
+      requireShape(positionals, ['editor'], 'fwa editor --fwe-path <absolute path> [--project <path>] [--port <port>] [--allow-write] [--codex-path <absolute native executable>]');
+      rejectOptions(options, ['project', 'fwePath', 'port', 'allowWrite', 'codexPath', 'reviewConfig']);
       if (!options.fwePath || !path.isAbsolute(options.fwePath)) throw new CliUsageError('--fwe-path must be an absolute FWE checkout path.');
       if (options.port !== undefined && (!/^\d+$/.test(options.port) || Number(options.port) < 1 || Number(options.port) > 65535)) {
         throw new CliUsageError('--port must be an integer from 1 to 65535.');
       }
-      const { startEditor } = await import('./editor/server.js');
+      const codexPath = options.codexPath === undefined ? undefined : await nativeCodexPath(options.codexPath);
+      const startEditor = io.startEditor ?? (await import('./editor/server.js')).startEditor;
       const editor = await startEditor({ projectRoot, fwePath: options.fwePath,
-        port: options.port === undefined ? 3220 : Number(options.port), allowWrite: options.allowWrite === true, signal });
+        port: options.port === undefined ? 3220 : Number(options.port), allowWrite: options.allowWrite === true, signal,
+        ...(options.reviewConfig === undefined ? {} : { reviewConfig: path.resolve(cwd, options.reviewConfig) }),
+        ...(codexPath === undefined ? {} : { workflow: { codexOptions: { executable: codexPath } } }) });
       const ready = { url: editor.url, projectRoot: editor.projectRoot, projectId: editor.projectId,
-        allowWrite: editor.allowWrite, fingerprint: editor.fingerprint, protocol: editor.protocol, fwePath: editor.fwePath };
+        allowWrite: editor.allowWrite, fingerprint: editor.fingerprint, protocol: editor.protocol, fwePath: editor.fwePath,
+        ...(codexPath === undefined ? {} : { codexPath }) };
       if (wantsJson) writeJson(stdout, ready);
-      else writeLine(stdout, `FWA console (${editor.allowWrite ? 'controlled write' : 'read-only'}): ${editor.url}\nProject: ${editor.projectRoot}\nFWE: ${editor.fwePath}\nExecution, evaluation, integration and recovery remain explicit CLI operations.`);
+      else writeLine(stdout, `FWA console (${editor.allowWrite ? 'controlled write' : 'read-only'}): ${editor.url}\nProject: ${editor.projectRoot}\nFWE: ${editor.fwePath}${codexPath === undefined ? '' : `\nCodex: ${codexPath}`}\nOpening the console does not start a Run; workflow actions require an explicit request.`);
       await editor.closed;
       return 0;
     }

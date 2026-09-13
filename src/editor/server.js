@@ -4,6 +4,13 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { FwaApplication } from '../application/fwa-application.js';
+import { WorkbenchController } from '../application/workbench-controller.js';
+import { REFERENCE_LIBRARY_LIMITS } from '../storage/library-files.js';
+import { INTERACTION_FIELDS, INTERACTION_LIMITS } from '../core/interaction-contract.js';
+import { applyEditorModel } from './editor-model.js';
+import { ReviewController } from '../application/review-controller.js';
+import { loadReviewConfig, normalizeReviewConfig } from '../application/review-config.js';
+import { ChangeExperiments } from '../application/change-experiments.js';
 
 export const CONSOLE_PROTOCOL = 'fwa-console-v1';
 const require = createRequire(import.meta.url);
@@ -13,7 +20,8 @@ const expectedContract = {
   requestGuard: 'await-before-routing-v1',
   extensions: 'sync-setup-async-handlers-v1',
   launchRevision: 'fwe-launch-v1',
-  runtimeFingerprint: 'fwe-runtime-v1'
+  runtimeFingerprint: 'fwe-runtime-v1',
+  configuredSurfaces: 'native-inspector-v1'
 };
 const fwaRoot = fileURLToPath(new URL('../../', import.meta.url));
 async function fwaRuntimeFingerprint() {
@@ -45,12 +53,12 @@ function equalSecret(actual, expected) {
 }
 
 /** Load one explicitly selected, trusted FWE checkout. No npm resolution/fallback. */
-export async function startEditor({ projectRoot, fwePath, port = 3220, allowWrite = false, signal } = {}) {
+export async function startEditor({ projectRoot, fwePath, port = 3220, allowWrite = false, open = false, signal, workflow, reviewConfig } = {}) {
   if (typeof fwePath !== 'string' || !path.isAbsolute(fwePath)) {
     throw failure('--fwe-path must be an absolute path to a compatible FWE checkout.');
   }
-  if (!Number.isInteger(port) || port < 0 || port > 65535 || typeof allowWrite !== 'boolean') {
-    throw failure('Editor port must be an integer from 0 to 65535; allowWrite must be boolean.', 'invalid-editor-options');
+  if (!Number.isInteger(port) || port < 0 || port > 65535 || typeof allowWrite !== 'boolean' || typeof open !== 'boolean') {
+    throw failure('Editor port must be an integer from 0 to 65535; allowWrite and open must be boolean.', 'invalid-editor-options');
   }
   signal?.throwIfAborted();
   const selectedFwePath = await realpath(fwePath);
@@ -82,6 +90,12 @@ export async function startEditor({ projectRoot, fwePath, port = 3220, allowWrit
   const application = new FwaApplication(projectRoot, { actor: 'fwa-console' });
   // Does not init or repair a project. A read-only launch must not write state.
   const initialStatus = await application.getStatus();
+  const configuredReview = reviewConfig === undefined ? null : typeof reviewConfig === 'string'
+    ? await loadReviewConfig(reviewConfig) : normalizeReviewConfig(reviewConfig);
+  const workbench = new WorkbenchController(application, { ...workflow, validationProfiles: configuredReview?.validationProfiles || [] });
+  const review = new ReviewController(application, { config: configuredReview, jobs: workbench.jobs, signal: workbench.abortController.signal });
+  const experiments = new ChangeExperiments(application, { targetRef: review.config?.targetRef,
+    config: review.config?.experiment, jobs: workbench.jobs, signal: workbench.abortController.signal });
   const app = fwe.loadAppConfig(appPath);
   if (!/^fwe-launch-v1:[a-f0-9]{64}$/.test(app.launchRevision || '')) {
     throw failure('Selected FWE did not provide its source launch fingerprint.');
@@ -89,18 +103,28 @@ export async function startEditor({ projectRoot, fwePath, port = 3220, allowWrit
   // workspaceDir is a public programmatic App property consumed by sourceContext.
   // The launch fingerprint is combined with this fixed project and capability below.
   app.workspaceDir = application.projectRoot;
+  applyEditorModel(app.domains[0]);
   app.domains[0].source.expectedProjectId = initialStatus.projectId;
+  const uiConfigs = {};
+  for (const [name, relative] of Object.entries(app.domains[0].workbench.editor.configs)) {
+    // These are trusted adapter files, never paths supplied by browser/project data.
+    uiConfigs[name] = JSON.parse(await readFile(path.resolve(path.dirname(appPath), relative), 'utf8'));
+  }
   const fingerprint = createHash('sha256').update(JSON.stringify({
     protocol: CONSOLE_PROTOCOL, contract: expectedContract, launchRevision: app.launchRevision,
     fwaRuntime: loadedFwaFingerprint, fweRuntime: fwe.SERVER_RUNTIME_FINGERPRINT,
-    projectId: initialStatus.projectId, projectRoot: application.projectRoot, allowWrite
+    projectId: initialStatus.projectId, projectRoot: application.projectRoot, allowWrite,
+    workflowCapabilities: workbench.capabilities(), reviewCapabilities: review.capabilities()
   })).digest('hex');
   const csrfToken = randomBytes(32).toString('hex');
-  const state = Object.freeze({ application, projectId: initialStatus.projectId,
+  const state = Object.freeze({ application, workbench, review, experiments, projectId: initialStatus.projectId,
     projectRoot: application.projectRoot, allowWrite, fingerprint, protocol: CONSOLE_PROTOCOL,
     csrfToken, fweVersion: metadata.version, fwePath: selectedFwePath, launchRevision: app.launchRevision });
   app.fwaConsole = state;
-  app.labels.fwaConsole = { protocol: CONSOLE_PROTOCOL, fingerprint };
+  app.labels.fwaConsole = { protocol: CONSOLE_PROTOCOL, fingerprint, uiConfigs,
+    interactionLimits: INTERACTION_LIMITS,
+    importLimits: { ...REFERENCE_LIBRARY_LIMITS, maxUploadBytes: REFERENCE_LIBRARY_LIMITS.maxArchiveBytes,
+      maxLabelLength: INTERACTION_FIELDS.libraryLabel.maxLength } };
   const guard = async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
@@ -115,7 +139,7 @@ export async function startEditor({ projectRoot, fwePath, port = 3220, allowWrit
     await assertSourcesUnchanged();
     if (req.method === 'GET' || req.method === 'HEAD') return true;
     // Even an authorized client cannot use generic CRUD, app stop, or recovery APIs.
-    if (req.method !== 'POST' || req.url !== '/api/fwa/commands') {
+    if (req.method !== 'POST' || !['/api/fwa/commands', '/api/fwa/import'].includes(req.url)) {
       throw failure('Generic mutations are disabled; use a supported FWA command.', 'editor-route-readonly', 405);
     }
     if (!allowWrite) throw failure('Console is read-only. Restart with --allow-write to enable commands.', 'editor-readonly', 403);
@@ -131,10 +155,10 @@ export async function startEditor({ projectRoot, fwePath, port = 3220, allowWrit
     return true;
   };
   await assertSourcesUnchanged();
-  const server = await fwe.startServer(app, '127.0.0.1', port, { requestGuard: guard, quiet: true });
+  const server = await fwe.startServer(app, '127.0.0.1', port, { requestGuard: guard, quiet: true, open });
   const url = `http://127.0.0.1:${server.address().port}`;
   const closed = new Promise((resolve) => server.once('close', resolve));
-  const close = () => { server.close(); server.closeIdleConnections?.(); return closed; };
+  const close = () => { server.close(); server.closeIdleConnections?.(); return Promise.all([closed, workbench.close()]); };
   signal?.addEventListener('abort', close, { once: true });
   closed.then(() => signal?.removeEventListener('abort', close));
   if (signal?.aborted) await close();

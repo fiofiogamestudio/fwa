@@ -1,0 +1,1385 @@
+{
+  "texts": {
+    "unrecorded": "未记录",
+    "undeclared": "未声明",
+    "recordTitle": "原始记录",
+    "artifactTitle": "记录正文",
+    "artifactMismatch": "产物摘要或大小与当前历史引用不符。",
+    "artifactUrlMismatch": "媒体地址未绑定此不可变产物。",
+    "refUrlMismatch": "资源预览地址不符合当前项目合同。",
+    "dependencies": "前置依赖",
+    "references": "输入与写入引用",
+    "runs": "执行尝试",
+    "changes": "变更集",
+    "evidence": "验收证据",
+    "acceptanceRecord": "任务范围与验收合同",
+    "consumers": "声明读取",
+    "writers": "声明写入",
+    "refRecord": "Ref 完整记录",
+    "workspaceNotice": "当前工作区内容，并非历史版本快照。",
+    "emptyFile": "（空文件）",
+    "unsupportedPreview": "该资源类型暂不支持在线预览。",
+    "acceptanceResults": "验收结果",
+    "locateNode": "定位任务节点",
+    "consumedRefs": "当次执行绑定的 Ref 版本（声明快照）",
+    "relatedEvidence": "检查结果",
+    "patchTitle": "文件差异",
+    "stdout": "输出",
+    "stderr": "错误",
+    "locateChange": "定位变更集",
+    "eventCount": "{count} 条{associated}事件 · 按持久化顺序排列",
+    "relationsTitle": "{title} · {count}",
+    "nodeKicker": "NODE / {id}",
+    "changeTitle": "{count} 个文件变更",
+    "artifactIdentity": "SHA-256 {digest} · {size} B",
+    "eventSequence": "#{sequence}"
+  },
+  "fields": {
+    "reviewNote": {
+      "schemaPath": "commands.reviewNote",
+      "type": "textarea",
+      "label": "验收结论",
+      "rows": 3
+    },
+    "reviewProfile": {
+      "type": "select",
+      "label": "项目验证配置",
+      "options": []
+    },
+    "revertNote": {
+      "schemaPath": "commands.reviewNote",
+      "type": "textarea",
+      "label": "撤销原因",
+      "rows": 3
+    }
+  },
+  "templates": {
+    "review": {
+      "type": "fieldset",
+      "testId": "fwa-change-review",
+      "children": [
+        {
+          "type": "heading",
+          "text": {
+            "$path": "phase"
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "failureText"
+          },
+          "tone": "danger",
+          "visible": {
+            "$path": "failureText"
+          }
+        },
+        {
+          "type": "list",
+          "items": {
+            "$path": "blockers"
+          },
+          "template": "text"
+        },
+        {
+          "type": "field",
+          "field": "reviewNote",
+          "attrs": {
+            "name": "acceptanceNote"
+          },
+          "value": {
+            "$path": "draft.acceptanceNote"
+          },
+          "on": {
+            "input": "reviewDraft"
+          },
+          "visible": {
+            "$path": "showAccept"
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "acceptedText"
+          },
+          "visible": {
+            "$path": "acceptedText"
+          }
+        },
+        {
+          "type": "toolbar",
+          "children": [
+            {
+              "type": "button",
+              "text": "验证这项修改",
+              "attrs": {
+                "disabled": {
+                  "$path": "validateDisabled"
+                },
+                "data-action": "validate"
+              },
+              "on": {
+                "click": "reviewAction"
+              },
+              "visible": {
+                "$path": "showValidate"
+              },
+              "tone": "primary"
+            },
+            {
+              "type": "button",
+              "text": "记录人工验收",
+              "attrs": {
+                "disabled": {
+                  "$path": "acceptDisabled"
+                },
+                "data-action": "accept"
+              },
+              "on": {
+                "click": "reviewAction"
+              },
+              "visible": {
+                "$path": "showAccept"
+              },
+              "tone": "primary"
+            },
+            {
+              "type": "button",
+              "text": "回归通过后采用",
+              "attrs": {
+                "disabled": {
+                  "$path": "integrateDisabled"
+                },
+                "data-action": "integrate"
+              },
+              "on": {
+                "click": "reviewAction"
+              },
+              "visible": {
+                "$path": "showIntegrate"
+              },
+              "tone": "primary"
+            }
+          ]
+        },
+        {
+          "type": "details",
+          "ref": "impact",
+          "attrs": {
+            "open": {
+              "$path": "draft.impactOpen"
+            }
+          },
+          "children": [
+            {
+              "type": "summary",
+              "text": "撤销此项：查看依赖影响"
+            },
+            {
+              "type": "text",
+              "text": "撤销后保留其他修改；冲突或回归失败时不会生效。"
+            },
+            {
+              "type": "text",
+              "text": {
+                "$path": "impactText"
+              }
+            },
+            {
+              "type": "field",
+              "field": "revertNote",
+              "attrs": {
+                "name": "revertNote"
+              },
+              "value": {
+                "$path": "draft.revertNote"
+              },
+              "on": {
+                "input": "reviewDraft"
+              }
+            },
+            {
+              "type": "button",
+              "text": "已查看影响，验证后撤销此项",
+              "attrs": {
+                "disabled": {
+                  "$path": "revertDisabled"
+                },
+                "data-action": "revert"
+              },
+              "on": {
+                "click": "reviewAction"
+              }
+            }
+          ],
+          "visible": {
+            "$path": "showRevert"
+          }
+        },
+        {
+          "type": "text",
+          "ref": "message",
+          "attrs": {
+            "role": "status"
+          }
+        },
+        {
+          "type": "details",
+          "ref": "settings",
+          "attrs": {
+            "open": {
+              "$path": "draft.settingsOpen"
+            }
+          },
+          "children": [
+            {
+              "type": "summary",
+              "text": "验证设置"
+            },
+            {
+              "type": "field",
+              "field": "reviewProfile",
+              "ref": "profile",
+              "attrs": {
+                "name": "profileId"
+              },
+              "value": {
+                "$path": "draft.profileId"
+              },
+              "on": {
+                "change": "reviewDraft"
+              }
+            },
+            {
+              "type": "text",
+              "text": {
+                "$path": "targetRef",
+                "default": "尚未配置目标分支"
+              }
+            },
+            {
+              "type": "details",
+              "children": [
+                {
+                  "type": "summary",
+                  "text": "验收规则"
+                },
+                {
+                  "type": "text",
+                  "text": "检查通过后仍需人工验收。采用和撤销都会再次运行回归检查。"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "details",
+          "ref": "jobs",
+          "attrs": {
+            "open": {
+              "$path": "draft.jobsOpen"
+            }
+          },
+          "children": [
+            {
+              "type": "summary",
+              "text": "操作记录"
+            },
+            {
+              "type": "list",
+              "items": {
+                "$path": "jobs"
+              },
+              "template": "text"
+            }
+          ]
+        }
+      ]
+    },
+    "stack": {
+      "type": "stack"
+    },
+    "card": {
+      "type": "card"
+    },
+    "row": {
+      "type": "row"
+    },
+    "text": {
+      "type": "text",
+      "text": {
+        "$path": "text"
+      },
+      "tone": {
+        "$path": "tone",
+        "default": ""
+      }
+    },
+    "heading": {
+      "type": "heading",
+      "text": {
+        "$path": "text"
+      }
+    },
+    "pre": {
+      "type": "pre",
+      "text": {
+        "$path": "text"
+      },
+      "tone": {
+        "$path": "tone",
+        "default": ""
+      }
+    },
+    "badge": {
+      "type": "badge",
+      "text": {
+        "$path": "text"
+      },
+      "tone": {
+        "$path": "tone",
+        "default": ""
+      }
+    },
+    "details": {
+      "type": "details"
+    },
+    "summary": {
+      "type": "summary",
+      "text": {
+        "$path": "text"
+      }
+    },
+    "link": {
+      "type": "link",
+      "text": {
+        "$path": "text"
+      }
+    },
+    "image": {
+      "type": "image",
+      "preset": "image"
+    },
+    "label": {
+      "type": "label",
+      "text": {
+        "$path": "text"
+      }
+    },
+    "list": {
+      "type": "stack",
+      "attrs": {
+        "role": "list"
+      }
+    },
+    "listItem": {
+      "type": "text",
+      "text": {
+        "$path": "text"
+      },
+      "attrs": {
+        "role": "listitem"
+      }
+    },
+    "option": {
+      "type": "option",
+      "text": {
+        "$path": "text"
+      }
+    },
+    "button": {
+      "type": "button",
+      "text": {
+        "$path": "text"
+      },
+      "on": {
+        "click": "invoke"
+      }
+    },
+    "status": {
+      "type": "badge",
+      "text": {
+        "$path": "label"
+      },
+      "tone": {
+        "$path": "tone",
+        "default": "muted"
+      }
+    },
+    "record": {
+      "type": "details",
+      "testId": "fwa-record",
+      "children": [
+        {
+          "type": "summary",
+          "text": {
+            "$path": "title"
+          }
+        },
+        {
+          "type": "pre",
+          "text": {
+            "$path": "json"
+          }
+        }
+      ]
+    },
+    "metadata": {
+      "type": "list",
+      "items": {
+        "$path": "rows"
+      },
+      "template": "metadataRow",
+      "attrs": {
+        "role": "list"
+      }
+    },
+    "metadataRow": {
+      "type": "columns",
+      "columns": 2,
+      "attrs": {
+        "role": "listitem"
+      },
+      "children": [
+        {
+          "type": "text",
+          "text": {
+            "$path": "label"
+          },
+          "tone": "muted"
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "value",
+            "default": "未记录"
+          }
+        }
+      ]
+    },
+    "relations": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "heading",
+          "text": {
+            "$text": "relationsTitle"
+          }
+        },
+        {
+          "type": "stack",
+          "ref": "items"
+        },
+        {
+          "type": "text",
+          "text": "暂无记录",
+          "tone": "muted",
+          "visible": {
+            "$path": "empty"
+          }
+        }
+      ]
+    },
+    "artifactLinks": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "toolbar",
+          "ref": "actions"
+        },
+        {
+          "type": "stack",
+          "ref": "viewer"
+        }
+      ]
+    },
+    "artifactButton": {
+      "type": "button",
+      "text": {
+        "$path": "text"
+      },
+      "on": {
+        "click": "artifact"
+      }
+    },
+    "artifactLoading": {
+      "type": "text",
+      "text": "正在校验并读取不可变产物…",
+      "tone": "muted"
+    },
+    "artifact": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "heading",
+          "text": {
+            "$path": "name"
+          }
+        },
+        {
+          "type": "text",
+          "text": "正文过长，当前仅展示截断预览。",
+          "tone": "warning",
+          "visible": {
+            "$path": "truncated"
+          }
+        },
+        {
+          "type": "slot",
+          "ref": "body"
+        },
+        {
+          "type": "details",
+          "children": [
+            {
+              "type": "summary",
+              "text": "产物校验信息"
+            },
+            {
+              "type": "text",
+              "text": {
+                "$text": "artifactIdentity"
+              },
+              "tone": "muted"
+            }
+          ]
+        }
+      ]
+    },
+    "artifactImage": {
+      "type": "image",
+      "testId": "fwa-artifact-media",
+      "preset": "image",
+      "attrs": {
+        "src": {
+          "$path": "url"
+        },
+        "alt": {
+          "$path": "name"
+        }
+      }
+    },
+    "historicalMediaNotice": {
+      "type": "text",
+      "text": "来自此项目历史所绑定的不可变产物。是否为真实游戏画面、前后版本对应关系，仍须结合验收合同与捕获记录核对。",
+      "tone": "info"
+    },
+    "emptyArtifact": {
+      "type": "text",
+      "text": "空产物（0 字节），不表示任务成功。",
+      "tone": "muted"
+    },
+    "errorOutput": {
+      "type": "pre",
+      "text": {
+        "$path": "text"
+      },
+      "tone": "danger",
+      "testId": "fwa-error-output"
+    },
+    "artifactText": {
+      "type": "pre",
+      "text": {
+        "$path": "text"
+      },
+      "testId": "fwa-artifact-text"
+    },
+    "missingNode": {
+      "type": "text",
+      "text": "节点已不在当前快照中。"
+    },
+    "node": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "text",
+          "text": {
+            "$text": "nodeKicker"
+          },
+          "tone": "muted"
+        },
+        {
+          "type": "heading",
+          "text": {
+            "$path": "title"
+          }
+        },
+        {
+          "type": "list",
+          "items": {
+            "$path": "statuses"
+          },
+          "template": "status"
+        },
+        {
+          "type": "list",
+          "items": {
+            "$path": "blockers"
+          },
+          "template": "blocker"
+        },
+        {
+          "type": "template",
+          "template": "metadata",
+          "data": {
+            "rows": [
+              {
+                "label": "目标",
+                "value": {
+                  "$path": "goalTitle",
+                  "default": "未记录"
+                }
+              },
+              {
+                "label": "尝试次数",
+                "value": {
+                  "$path": "runCount",
+                  "default": "未记录"
+                }
+              },
+              {
+                "label": "最大重试",
+                "value": {
+                  "$path": "budget.maxRetries",
+                  "default": "未记录"
+                }
+              },
+              {
+                "label": "文件上限",
+                "value": {
+                  "$path": "budget.maxFiles",
+                  "default": "未记录"
+                }
+              },
+              {
+                "label": "Diff 行数上限",
+                "value": {
+                  "$path": "budget.maxDiffLines",
+                  "default": "未记录"
+                }
+              },
+              {
+                "label": "所需能力",
+                "value": {
+                  "$path": "capabilitiesText",
+                  "default": "未记录"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "stack",
+          "ref": "dependencies"
+        },
+        {
+          "type": "stack",
+          "ref": "references"
+        },
+        {
+          "type": "stack",
+          "ref": "runs"
+        },
+        {
+          "type": "stack",
+          "ref": "changes"
+        },
+        {
+          "type": "stack",
+          "ref": "evidence"
+        },
+        {
+          "type": "button",
+          "text": "填写重试申请",
+          "visible": {
+            "$path": "canRetry"
+          },
+          "on": {
+            "click": "retry"
+          }
+        },
+        {
+          "type": "stack",
+          "ref": "records"
+        }
+      ]
+    },
+    "blocker": {
+      "type": "text",
+      "text": {
+        "$path": "$item"
+      },
+      "tone": "warning"
+    },
+    "ref": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "text",
+          "text": "REFERENCE / 输入资源",
+          "tone": "muted"
+        },
+        {
+          "type": "heading",
+          "text": {
+            "$path": "uri"
+          }
+        },
+        {
+          "type": "slot",
+          "ref": "preview",
+          "testId": "fwa-ref-preview",
+          "children": [
+            {
+              "type": "text",
+              "text": "读取资源…",
+              "tone": "muted"
+            }
+          ]
+        },
+        {
+          "type": "template",
+          "template": "metadata",
+          "data": {
+            "rows": [
+              {
+                "label": "逻辑标识",
+                "value": {
+                  "$path": "id",
+                  "default": "未记录"
+                }
+              },
+              {
+                "label": "类型",
+                "value": {
+                  "$path": "kind",
+                  "default": "未记录"
+                }
+              },
+              {
+                "label": "注册版本",
+                "value": {
+                  "$path": "version",
+                  "default": "未记录"
+                }
+              },
+              {
+                "label": "来源",
+                "value": {
+                  "$path": "provenance",
+                  "default": "未记录"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "stack",
+          "ref": "consumers"
+        },
+        {
+          "type": "stack",
+          "ref": "writers"
+        },
+        {
+          "type": "text",
+          "text": "关系来自任务声明，不证明执行器实际读取过内容。",
+          "tone": "muted"
+        },
+        {
+          "type": "stack",
+          "ref": "records"
+        }
+      ]
+    },
+    "refPreview": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "heading",
+          "text": "内容预览"
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "versionLabel"
+          },
+          "tone": "info"
+        },
+        {
+          "type": "text",
+          "text": "内容摘要与注册值不同；这可能包含换行变化。不能将当前内容当作当次执行输入。",
+          "tone": "warning",
+          "visible": {
+            "$path": "hashChanged"
+          }
+        },
+        {
+          "type": "slot",
+          "ref": "body"
+        }
+      ]
+    },
+    "refImage": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "image",
+          "ref": "image",
+          "preset": "image",
+          "attrs": {
+            "src": {
+              "$path": "url"
+            },
+            "alt": {
+              "$path": "name"
+            },
+            "loading": "lazy"
+          }
+        },
+        {
+          "type": "link",
+          "text": "在新标签页查看原图",
+          "attrs": {
+            "href": {
+              "$path": "url"
+            },
+            "target": "_blank",
+            "rel": "noopener noreferrer"
+          }
+        }
+      ]
+    },
+    "imageError": {
+      "type": "text",
+      "text": "图片未能加载，请检查资源或服务状态。",
+      "tone": "danger"
+    },
+    "run": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "text",
+          "text": "RUN / 执行尝试",
+          "tone": "muted"
+        },
+        {
+          "type": "heading",
+          "text": {
+            "$path": "title"
+          }
+        },
+        {
+          "type": "template",
+          "template": "status",
+          "data": {
+            "$path": "statusView"
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "summary",
+            "default": ""
+          },
+          "tone": "info"
+        },
+        {
+          "type": "template",
+          "template": "metadata",
+          "data": {
+            "rows": [
+              {
+                "label": "执行器",
+                "value": {
+                  "$path": "executorLabel",
+                  "default": "未记录"
+                }
+              },
+              {
+                "label": "开始",
+                "value": {
+                  "$path": "started",
+                  "default": "未记录"
+                }
+              },
+              {
+                "label": "结束",
+                "value": {
+                  "$path": "ended",
+                  "default": "未记录"
+                }
+              },
+              {
+                "label": "基线",
+                "value": {
+                  "$path": "baseRevision",
+                  "default": "未记录"
+                }
+              },
+              {
+                "label": "工作区",
+                "value": {
+                  "$path": "workspacePath",
+                  "default": "未记录"
+                }
+              },
+              {
+                "label": "工作区状态",
+                "value": {
+                  "$path": "workspaceStatus",
+                  "default": "未记录"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "stack",
+          "visible": {
+            "$path": "hasFailure"
+          },
+          "children": [
+            {
+              "type": "heading",
+              "text": "失败原因"
+            },
+            {
+              "type": "text",
+              "text": {
+                "$path": "failureText"
+              },
+              "tone": "danger"
+            },
+            {
+              "type": "pre",
+              "text": {
+                "$path": "stderr"
+              },
+              "tone": "danger",
+              "visible": {
+                "$path": "stderr"
+              }
+            }
+          ]
+        },
+        {
+          "type": "stack",
+          "ref": "changes"
+        },
+        {
+          "type": "stack",
+          "ref": "artifacts"
+        },
+        {
+          "type": "stack",
+          "ref": "evidence"
+        },
+        {
+          "type": "stack",
+          "ref": "nodeLink"
+        },
+        {
+          "type": "stack",
+          "ref": "records"
+        }
+      ]
+    },
+    "changeSet": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "text",
+          "text": {
+            "$path": "instruction"
+          },
+          "visible": {
+            "$path": "instruction"
+          }
+        },
+        {
+          "type": "text",
+          "text": "此变更集没有文件变化，不能据此判断需求已经完成。",
+          "tone": "warning",
+          "visible": {
+            "$not": {
+              "$path": "count"
+            }
+          }
+        },
+        {
+          "type": "list",
+          "attrs": {
+            "role": "list"
+          },
+          "items": {
+            "$path": "files"
+          },
+          "template": "changedFile"
+        },
+        {
+          "type": "stack",
+          "ref": "diff"
+        },
+        {
+          "type": "stack",
+          "ref": "evidence"
+        },
+        {
+          "type": "stack",
+          "ref": "review"
+        },
+        {
+          "type": "stack",
+          "ref": "experiment"
+        },
+        {
+          "type": "details",
+          "children": [
+            {
+              "type": "summary",
+              "text": "版本与技术记录"
+            },
+            {
+              "type": "template",
+              "template": "metadata",
+              "data": {
+                "rows": [
+                  {
+                    "label": "变更集",
+                    "value": {
+                      "$path": "id",
+                      "default": "未记录"
+                    }
+                  },
+                  {
+                    "label": "基线",
+                    "value": {
+                      "$path": "baseRevision",
+                      "default": "未记录"
+                    }
+                  },
+                  {
+                    "label": "候选版本",
+                    "value": {
+                      "$path": "headRevision",
+                      "default": "未记录"
+                    }
+                  },
+                  {
+                    "label": "Diff 行数",
+                    "value": {
+                      "$path": "diffLines",
+                      "default": "未记录"
+                    }
+                  },
+                  {
+                    "label": "记录时间",
+                    "value": {
+                      "$path": "captured",
+                      "default": "未记录"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "type": "stack",
+              "ref": "artifacts"
+            },
+            {
+              "type": "stack",
+              "ref": "records"
+            }
+          ]
+        }
+      ]
+    },
+    "changedFile": {
+      "type": "text",
+      "text": {
+        "$path": "$item"
+      },
+      "attrs": {
+        "role": "listitem"
+      }
+    },
+    "evidence": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "text",
+          "text": "EVIDENCE / 验收证据",
+          "tone": "muted"
+        },
+        {
+          "type": "heading",
+          "text": {
+            "$path": "statusView.label"
+          }
+        },
+        {
+          "type": "template",
+          "template": "status",
+          "data": {
+            "$path": "statusView"
+          }
+        },
+        {
+          "type": "template",
+          "template": "metadata",
+          "data": {
+            "rows": [
+              {
+                "label": "类型",
+                "value": {
+                  "$path": "kind",
+                  "default": "未记录"
+                }
+              },
+              {
+                "label": "验证版本",
+                "value": {
+                  "$path": "headRevision",
+                  "default": "未记录"
+                }
+              },
+              {
+                "label": "记录时间",
+                "value": {
+                  "$path": "recorded",
+                  "default": "未记录"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "stack",
+          "ref": "criteria",
+          "testId": "fwa-criteria",
+          "attrs": {
+            "role": "table",
+            "aria-label": "验收项结果"
+          },
+          "children": [
+            {
+              "type": "columns",
+              "columns": 4,
+              "attrs": {
+                "role": "row"
+              },
+              "children": [
+                {
+                  "type": "text",
+                  "text": "验收项",
+                  "tone": "muted",
+                  "attrs": {
+                    "role": "columnheader"
+                  }
+                },
+                {
+                  "type": "text",
+                  "text": "结果",
+                  "tone": "muted",
+                  "attrs": {
+                    "role": "columnheader"
+                  }
+                },
+                {
+                  "type": "text",
+                  "text": "耗时",
+                  "tone": "muted",
+                  "attrs": {
+                    "role": "columnheader"
+                  }
+                },
+                {
+                  "type": "text",
+                  "text": "证据",
+                  "tone": "muted",
+                  "attrs": {
+                    "role": "columnheader"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "slot",
+          "ref": "viewer"
+        },
+        {
+          "type": "stack",
+          "ref": "failures"
+        },
+        {
+          "type": "text",
+          "text": "编译通过只证明该候选版本通过编译，不等于功能、可玩性或视觉验收通过。",
+          "tone": "info"
+        },
+        {
+          "type": "stack",
+          "ref": "artifacts"
+        },
+        {
+          "type": "stack",
+          "ref": "changeLink"
+        },
+        {
+          "type": "stack",
+          "ref": "records"
+        }
+      ]
+    },
+    "criteriaRows": {
+      "type": "list",
+      "items": {
+        "$path": "rows"
+      },
+      "template": "criterionRow",
+      "attrs": {
+        "role": "rowgroup"
+      }
+    },
+    "criterionRow": {
+      "type": "columns",
+      "columns": 4,
+      "attrs": {
+        "role": "row",
+        "data-criterion": {
+          "$path": "id"
+        }
+      },
+      "children": [
+        {
+          "type": "text",
+          "text": {
+            "$path": "id"
+          },
+          "attrs": {
+            "role": "cell"
+          }
+        },
+        {
+          "type": "stack",
+          "attrs": {
+            "role": "cell"
+          },
+          "children": [
+            {
+              "type": "template",
+              "template": "status",
+              "data": {
+                "$path": "resultView"
+              }
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "duration"
+          },
+          "attrs": {
+            "role": "cell"
+          }
+        },
+        {
+          "type": "list",
+          "items": {
+            "$path": "logs"
+          },
+          "template": "artifactButton",
+          "attrs": {
+            "role": "cell"
+          }
+        }
+      ]
+    },
+    "events": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "text",
+          "ref": "status",
+          "text": "读取事件…",
+          "tone": "muted",
+          "attrs": {
+            "role": "status"
+          }
+        },
+        {
+          "type": "stack",
+          "ref": "list",
+          "testId": "fwa-events",
+          "attrs": {
+            "role": "list"
+          }
+        },
+        {
+          "type": "button",
+          "ref": "more",
+          "text": "加载更多事件",
+          "on": {
+            "click": "loadEvents"
+          }
+        }
+      ]
+    },
+    "event": {
+      "type": "card",
+      "attrs": {
+        "role": "listitem"
+      },
+      "children": [
+        {
+          "type": "row",
+          "children": [
+            {
+              "type": "text",
+              "text": {
+                "$text": "eventSequence"
+              },
+              "attrs": {
+                "data-event-sequence": {
+                  "$path": "sequence"
+                }
+              },
+              "tone": "muted"
+            },
+            {
+              "type": "text",
+              "text": {
+                "$path": "type"
+              }
+            },
+            {
+              "type": "text",
+              "text": {
+                "$path": "timestampLabel"
+              },
+              "tone": "muted"
+            }
+          ]
+        },
+        {
+          "type": "details",
+          "children": [
+            {
+              "type": "summary",
+              "text": "事件载荷与因果标识"
+            },
+            {
+              "type": "pre",
+              "text": {
+                "$path": "json"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

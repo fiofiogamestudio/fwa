@@ -3,13 +3,18 @@
 FWA turns agent-assisted game development into a traceable sequence of Goals,
 Nodes, Runs, ChangeSets, Evidence, integrations, and reversions.
 
-**Status:** the V0.1 Goal-to-revert engineering spine is implemented. A retained
+**Status:** the V0.1 Goal-to-revert engineering spine is implemented. The current
+workbench additionally implements reference-library import, real Codex planning,
+hierarchical plans, isolated parallel Run batches and explicit feedback revisions.
+Default Work stops after candidate production awaiting acceptance; this is not a
+complete autonomous game-delivery loop. See the current boundaries below.
+A retained
 live composition run validates the frozen source recorded in
 [`docs/v0.1-validation.md`](docs/v0.1-validation.md).
 That historical record does not automatically validate later changes or the
 future runtime, visual, learning, or multi-engine roadmap.
 
-## Relationship to `fw` and `fwe`
+## Relationship to FW, FWC and FWE
 
 FWA is a standalone component. Its current directory, `fw/fwa`, is a convenient
 co-location, not a runtime dependency.
@@ -20,14 +25,15 @@ evaluators are straightforward extension points. Replacing Git would require
 a repository-protocol redesign and equivalent recovery guarantees, not just
 renaming an adapter.
 
-- `fw` is the optional game runtime/framework.
+- `fw` is the top-level workspace/project and component manager.
+- `fwc` is the optional Godot/C# game runtime/framework.
 - `fwe` is the optional editor/control surface.
 - `fwa` is development orchestration.
 
-A game may use any one of them without the others. The architecture
+These components are siblings; FWA does not require a game to use FWC. The architecture
 specification's earlier “FW Agentic” and `fw` command examples map here to the
 independent `fwa` package, `fwa` CLI, and `.fwa` state directory; they do not
-turn FWA into part of the `fw` runtime.
+turn FWA into part of FWC or make the top-level FW package a game runtime.
 
 An optional FWE control console now consumes FWA application commands and
 projections through an outer adapter. Neither core imports the other. The
@@ -35,7 +41,7 @@ console uses an explicitly selected independent FWE checkout, not a nested
 copy or npm dependency. FWA's package boundary test rejects dependencies from
 core to `fw`, `fwe`, adapters, or third-party packages.
 
-## What V0.1 implements
+## What the historical V0.1 scope implements
 
 - strict Goal and human-authored DAG validation;
 - logical, versioned Refs resolved to physical workspace paths;
@@ -54,11 +60,14 @@ core to `fw`, `fwe`, adapters, or third-party packages.
 - append-only hash-chained events, idempotent commands, recovery, status, and
   offline integrity verification.
 
-Automatic planning, vector/embedding/RAG knowledge systems, planner or reviewer
+The frozen V0.1 scope excluded automatic planning, vector/embedding/RAG knowledge systems, planner or reviewer
 swarms, a full visual execution/recovery workflow, Unity runtime/PlayMode scenarios, screenshots, telemetry,
 semantic conflicts, learning, distributed execution, multiple engine adapters,
-authenticated approval, automated game design, and hostile code confinement
-are intentionally outside V0.1.
+authenticated approval, automated game design, and hostile code confinement.
+This is a historical boundary, not a list of
+everything still missing today: the current planning, batch execution and
+revision capabilities are described below and in
+[`docs/interactive-workflow.md`](docs/interactive-workflow.md).
 
 ## Requirements
 
@@ -66,10 +75,35 @@ are intentionally outside V0.1.
 - Git available on `PATH`;
 - a local Git repository whose ignore rules exclude `.fwa/**`;
 - Git author configuration for generated commits;
-- Codex CLI only when selecting the Codex executor;
+- a compatible, configured Codex CLI for real Plan or the Codex executor;
 - Unity Editor only when using the Unity evaluator profile.
 
 FWA has no npm dependencies.
+
+## Windows quick launch
+
+Double-click `start.bat`, or run `npm.cmd start`. The launcher opens the FWA
+console in your browser using the sibling `../fwe` checkout. The first launch
+creates an isolated Git demo at `.local/demo`; later launches preserve its
+goals, files and history. The demo enables the console's controlled write
+commands. Plan and Work still require an installed, configured Codex CLI.
+Local demos and verification reports live under ignored `.local/`;
+retained historical reports are in `.local/reports/`.
+
+```powershell
+.\start.bat --check
+.\start.bat --project D:/Games/MyGame
+.\start.bat --project D:/Games/MyGame --allow-write --fwe-path D:/Tools/fwe
+.\start.bat --no-open --port 3220
+```
+
+`--check` only checks launcher prerequisites and prints the selected paths and
+options; it creates no demo or server. An explicit `--project` must already
+be initialized, and defaults to read-only. The launcher never initializes a
+supplied project. `--port` defaults to `0` (an available local port); the
+actual URL opens after the server is ready. Keep the terminal running while
+using the console, and press Ctrl+C to stop it. Errors remain visible in the
+BAT window. Full FWE server-contract compatibility is checked when starting.
 
 ## Optional FWE control console
 
@@ -77,8 +111,10 @@ From the directory containing the independent `fwa/` and `fwe/` checkouts:
 
 ```powershell
 node fwa/bin/fwa.js editor --project D:/Games/MyGame --fwe-path D:/Git/fw/fwe
-# Enable only goal.create, plan.load and node.retry:
+# Enable the bounded import/planning/work/revision commands:
 node fwa/bin/fwa.js editor --project D:/Games/MyGame --fwe-path D:/Git/fw/fwe --port 3220 --allow-write
+# Optional: select an already-installed native CLI for this launch:
+node fwa/bin/fwa.js editor --project D:/Games/MyGame --fwe-path D:/Git/fw/fwe --allow-write --codex-path D:/Tools/Codex/codex.exe
 ```
 
 The project must already be initialized with `fwa init --project ...`. Launch
@@ -86,27 +122,106 @@ does not initialize, repair, clone, update, reuse or stop another server. It
 binds only `127.0.0.1`; the default port is `3220`. `--json` prints the ready
 URL/project/fingerprint, then the command remains running until stopped.
 
-The Chinese-first console shows the project, Goals, dependency Nodes, Runs,
-Evidence, ChangeSets, Refs, integrations, reversions, and persisted Git fence
-and workspace-lease snapshots. A fence snapshot is not a full `fwa verify`.
-Generic create/save/delete and FWE's stop API are disabled server-side, not
-just hidden in the toolbar. In read-only mode no application commands are
-submitted; existing storage inspection may use its short-lived read guards.
+`--codex-path` requires an existing fully qualified native executable, not a
+`.cmd`/`.bat` wrapper; Windows requires `.exe`. Omitting it retains the existing
+resolver. It does not install a CLI, bypass user configuration or lower the
+sandbox. Plan requests read-only execution; Work uses workspace-write in its
+assigned worktree. The executable is trusted launch configuration, never a
+browser payload field. Hosts that already provide `tools/fwa-ui.mjs` may use
+the optional `codexPath` beside `fwaPath`/`fwePath` in `.fwa/ui-launcher.json`;
+that host launcher is not installed by `fwa editor`.
 
-With explicit `--allow-write`, the only accepted commands are `goal.create`,
-`plan.load` (JSON content, never a file path) and `node.retry`. Each command
-goes through `FwaApplication`, requires a command ID, and retains its durable
-idempotency and validation rules. Unconfirmed browser requests retain their
+The Chinese-first workbench imports copies of files, directory trees or one ZIP
+and stores immutable library versions with inherited path permissions. It
+previews supported documents, images, video and audio, with a separate PDF link.
+Plan combines optional prose and selected library versions through the real
+Codex planning adapter, validates the result and loads an authored plan; missing
+information returns questions, not invented work. Parent/child decomposition is
+separate from executable dependency edges. Only leaf Nodes can run.
+
+Work dispatches ready leaves through `runReadyBatch`, with declared read/write
+and exclusive-resource conflict checks, one coordinator lease and independent
+Git worktrees. The default controller selects up to four leaves per round.
+Without a trusted acceptance/integration adapter, a successful batch stops at
+`awaiting-acceptance`; it does not automatically reach downstream leaves or
+done. With an explicit trusted `--review-config`, ChangeSet details now provide
+candidate validation, a separate recorded human acceptance, regression-gated
+adoption, and gated single-change reversion with dependency impact. See
+[`docs/change-review.md`](docs/change-review.md) for setup and exact boundaries.
+
+A batch containing any zero-file ChangeSet stops earlier at
+`no-changes-awaiting-review`, before automatic acceptance or integration.
+Inspect the exact Run output: a no-op may be legitimate or may reflect blocked
+tools. Neither process exit code zero nor an empty candidate proves completion.
+Older job records stay immutable; the UI adds warnings using their bound
+ChangeSets instead of relabeling their history.
+
+Node feedback is durable and blocks later dispatch until explicitly resolved.
+The operator requests a model-assisted or authored plan revision after active
+operations settle. Affected leaves get new physical Node versions while stable
+logical IDs, prior Runs, commits and Evidence remain traceable; unrelated
+branches retain their current results. Revisions do not automatically restart
+Work or silently consume feedback received during an active Run.
+
+The workbench also provides a hierarchy/dependency graph, a separate
+declared-Ref relationship graph, per-Node attempt history, ChangeSet file/patch
+inspection, Evidence criteria and log viewers, immutable image/video artifact
+viewers, and a paginated persisted-event timeline. Selecting
+a graph node or record opens its linked facts in the inspector. The same
+independent FWE checkout supplies the reusable pan/zoom/selection graph
+component; FWA supplies the domain projection, not a second graph engine.
+
+Execution status, validity and integration status remain separate. `produced`
+does not mean accepted or integrated, and Ref graph edges mean **declared**
+reads/writes, not observed file access or semantic requirement coverage.
+Ref previews show current workspace bytes, not historical Run inputs;
+library snapshots and immutable execution/evaluation artifacts are separate
+sources. The recursive plan/ready/work/done projection does not replace these
+states: a leaf is done only with a valid accepted result integrated into its
+Goal's target, and a parent is done only when all children are done.
+
+Library `deny` is enforced by content reads and snapshot omission, but read/write
+labels and copied-file modes are not an OS sandbox. The current executor treats
+all input snapshots as read-only; allowing modification of a library copy does
+not yet implement a write-back/new-version workflow. Media display does not
+automatically capture or pair before/after game revisions, or prove visual
+acceptance. Reference art and console recordings are not game-result evidence.
+
+The workbench checks for updates every five seconds while visible. Background
+updates preserve command drafts and pending-submit locks; drafts survive
+section changes, not page reloads. Project, Goal, integration, reversion and
+persisted Git fence/workspace-lease facts remain inspectable. A fence snapshot
+is not a full `fwa verify`. Generic create/save/delete and FWE's stop API are
+disabled server-side, not just hidden in the toolbar. In read-only mode no
+application commands are submitted; existing storage inspection may use its
+short-lived read guards. See [`docs/visual-workbench.md`](docs/visual-workbench.md)
+for view semantics, current limitations and a browser acceptance checklist.
+
+With explicit `--allow-write`, accepted commands are `goal.create`, `plan.load`,
+`node.retry`, `library.import`, `library.permission`, `workflow.plan`,
+`workflow.work`, `workflow.revise`, `node.feedback` and `plan.revise`.
+Trusted review configuration additionally enables `change.validate`,
+`change.accept`, `change.integrate`, and `change.revert`; an experiment runner
+and fixed conditions enable `experiment.run`. These operations retain durable
+jobs, exact-version checks, and the existing Git/evaluation gates.
+Plan JSON is content, never a server-side file path. Commands go through the
+application, reference library or durable workbench-job coordinator and retain
+their command-ID, idempotency and validation rules. Unconfirmed browser requests retain their
 ID in project-scoped `sessionStorage` across refresh, tab changes and reload;
 successful acknowledgement removes it. If storage is unavailable, dispatch
 fails rather than risking a lost ID. Closing the browser tab or clearing its
 storage loses this local pending lookup: inspect CLI events before repeating
-an uncertain command. Run, evaluate, integrate, revert and all recovery still
-require explicit CLI/API operations; the console never clears a lease or Git
-safety fence on the operator's behalf.
+an uncertain command. Job return/success is not Node acceptance. Review commands
+use trusted startup profiles and preserve the existing evaluation, integration
+and reversion gates. Recovery remains an explicit CLI/API operation; the console
+never clears a lease or Git safety fence on the operator's behalf.
+Ordinary workspace Ref registration/update, pause/resume, approval and the
+complete autonomous acceptance loop remain outside the current page.
 
 The adapter requires FWE `0.2.0` **with guarded server integration contract v1**.
-Older `0.2.0` checkouts without that capability are rejected. FWE's launch and
+Older `0.2.0` checkouts without that capability are rejected; the visual
+workbench also needs `fwe.ui.createGraph` from the graph-component checkout.
+FWE's launch and
 load-time runtime fingerprints, FWA's `src/`, `bin/` and package bytes, fixed
 project identity and write capability participate in the handshake. Every
 HTTP request rechecks source fingerprints. A detected edit, added/removed
@@ -125,9 +240,22 @@ optimistic event writes, workspace leases and Git fences; the console does
 not create a new cross-process transaction protocol.
 
 For embedding, import `src/editor/server.js` and call
-`startEditor({ projectRoot, fwePath, port, allowWrite, signal })`; the result
+`startEditor({ projectRoot, fwePath, port, allowWrite, open, signal, workflow })`; the result
 contains `url`, identity/fingerprint fields, `server`, `closed` and `close()`.
+The optional trusted `workflow` object may inject `planner`, `executor`,
+`codexOptions` and `acceptAndIntegrate`; browser requests cannot supply them.
 The API permits port `0` for isolated tests, while the CLI requires `1..65535`.
+The optional `open` flag defaults to `false`; the Windows launcher enables it
+to open the actual bound URL through FWE's existing browser helper.
+The read APIs accept only this project's persisted events, registered Refs,
+and complete artifact references reachable from events or verified JSON
+artifacts. Separate library reads address registered immutable versions and
+apply their current access rules. They reject arbitrary file paths, glob scanning, symlink/junction
+traversal and oversized previews; artifact bytes must match their authorized
+SHA-256 and size. Image metadata links bind the subsequent image response to
+the observed content hash. Reading evidence never triggers verification,
+recovery, cleanup, or an application mutation.
+
 HTTP integration tests use the sibling FWE when present, or the explicit
 `FWA_TEST_FWE_PATH`; standalone FWA tests report those optional tests skipped
 when FWE is absent. Core and normal CLI operations remain independent.
@@ -150,6 +278,16 @@ Windows. The retained real Codex/Unity composition validator is documented in
 [`tools/validate-v01-live.md`](tools/validate-v01-live.md). The frozen completion
 snapshot's test, coverage, live-run, and package evidence stays in
 [`docs/v0.1-validation.md`](docs/v0.1-validation.md).
+
+Current focused tests cover library import/permissions, hierarchy/revision
+replay, parallel execution, HTTP commands and UI lifecycles. The explicit
+`tools/check-workflow-planner.mjs` smoke invokes real Codex on a generated
+planning-only brief; `tools/check-interactive-workflow.mjs` exercises a real
+browser/API/Git pipeline with deterministic test adapters. Neither proves game
+delivery or visual acceptance. No complete-suite pass is asserted by this
+documentation; verify the report for the tested source version. See
+[`docs/visual-workbench.md`](docs/visual-workbench.md#浏览器验收清单) for the
+scripts' scopes and the evidence that must be checked separately.
 
 ## Try it without an engine or model account
 
@@ -192,7 +330,7 @@ fwa git recover --fence-id <id> --confirm-processes-stopped
 fwa status
 fwa events
 fwa verify
-fwa editor --fwe-path <absolute FWE checkout> [--port <port>] [--allow-write]
+fwa editor --fwe-path <absolute FWE checkout> [--port <port>] [--allow-write] [--codex-path <absolute native executable>]
 ```
 
 All commands accept `--project <path>`. Mutating public commands accept a

@@ -1,0 +1,1365 @@
+{
+  "root": "shell",
+  "sections": [
+    [
+      "intake",
+      "需求"
+    ],
+    [
+      "changeSets",
+      "修改"
+    ],
+    [
+      "progress",
+      "进度"
+    ],
+    [
+      "nodes",
+      "任务 DAG"
+    ],
+    [
+      "refs",
+      "引用与材料"
+    ],
+    [
+      "runs",
+      "执行历史"
+    ],
+    [
+      "evidence",
+      "验收证据"
+    ],
+    [
+      "events",
+      "事件时间线"
+    ],
+    [
+      "project",
+      "项目与安全"
+    ],
+    [
+      "commands",
+      "目标与计划"
+    ]
+  ],
+  "texts": {
+    "projectTitle": "项目工作台",
+    "graphNote": "“前置依赖”：前置任务 → 后续任务；“包含”：分组 → 子项，不代表执行依赖。状态、有效性、集成分别显示；布局不会改写执行记录。",
+    "refsNote": "关系由声明的 reads / writes 派生，不代表已实现需求或实际读取。选择对象查看版本与内容。",
+    "commandNotice": "手工创建目标、载入计划或重试。",
+    "readonly": "此控制台为只读模式，未授予提交命令的能力。",
+    "empty": "此范围尚无记录。",
+    "noMatch": "没有匹配的记录。",
+    "emptySelection": "选择图中的节点、引用或记录，查看关联事实。",
+    "historyTitle": "执行尝试 / {scope}",
+    "allGoals": "全部目标",
+    "eventHistory": "查看事件时间线",
+    "submitting": "提交中 · {commandId}",
+    "success": "{label}已记录{replay} · {commandId}",
+    "retryError": "{message}；响应丢失时保持内容不变重试，会复用同一命令 ID。",
+    "workAccepted": "已提交执行",
+    "safe": "当前快照未见 Git fence 或 workspace lease 占用；这不等同于完整 integrity 验证。",
+    "blocked": "存在安全阻断或占用。此处只展示事实，不自动清除。"
+  },
+  "templates": {
+    "inspector": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "slot",
+          "ref": "facts"
+        },
+        {
+          "type": "slot",
+          "ref": "feedback"
+        },
+        {
+          "type": "toolbar",
+          "ref": "links"
+        }
+      ]
+    },
+    "shell": {
+      "type": "fieldset",
+      "testId": "fwa-console",
+      "attrs": {
+        "data-fwa-workbench": true
+      },
+      "children": [
+        {
+          "type": "toolbar",
+          "children": [
+            {
+              "type": "field",
+              "ref": "goalSelect",
+              "field": {
+                "label": "当前目标",
+                "path": "goalSelect",
+                "type": "select"
+              },
+              "value": {
+                "$path": "goalSelect"
+              },
+              "attrs": {
+                "aria-label": "当前目标"
+              }
+            }
+          ],
+          "ref": "goalToolbar"
+        },
+        {
+          "type": "toolbar",
+          "ref": "tabs",
+          "attrs": {
+            "aria-label": "FWA 工作台分区"
+          },
+          "children": [
+            {
+              "type": "button",
+              "text": "需求",
+              "on": {
+                "click": "section"
+              },
+              "attrs": {
+                "data-section": "intake",
+                "aria-pressed": {
+                  "$eq": [
+                    {
+                      "$path": "section"
+                    },
+                    "intake"
+                  ]
+                }
+              },
+              "tone": {
+                "$if": [
+                  {
+                    "$eq": [
+                      {
+                        "$path": "section"
+                      },
+                      "intake"
+                    ]
+                  },
+                  "primary",
+                  "default"
+                ]
+              }
+            },
+            {
+              "type": "button",
+              "text": "修改",
+              "on": {
+                "click": "section"
+              },
+              "attrs": {
+                "data-section": "changeSets",
+                "aria-pressed": {
+                  "$eq": [
+                    {
+                      "$path": "section"
+                    },
+                    "changeSets"
+                  ]
+                }
+              },
+              "tone": {
+                "$if": [
+                  {
+                    "$eq": [
+                      {
+                        "$path": "section"
+                      },
+                      "changeSets"
+                    ]
+                  },
+                  "primary",
+                  "default"
+                ]
+              }
+            },
+            {
+              "type": "button",
+              "text": "进度",
+              "on": {
+                "click": "section"
+              },
+              "attrs": {
+                "data-section": "progress",
+                "aria-pressed": {
+                  "$eq": [
+                    {
+                      "$path": "section"
+                    },
+                    "progress"
+                  ]
+                }
+              },
+              "tone": {
+                "$if": [
+                  {
+                    "$eq": [
+                      {
+                        "$path": "section"
+                      },
+                      "progress"
+                    ]
+                  },
+                  "primary",
+                  "default"
+                ]
+              }
+            },
+            {
+              "type": "details",
+              "ref": "advanced",
+              "children": [
+                {
+                  "type": "summary",
+                  "text": "高级"
+                },
+                {
+                  "type": "toolbar",
+                  "children": [
+                    {
+                      "type": "button",
+                      "text": "任务 DAG",
+                      "on": {
+                        "click": "section"
+                      },
+                      "attrs": {
+                        "data-section": "nodes",
+                        "aria-pressed": {
+                          "$eq": [
+                            {
+                              "$path": "section"
+                            },
+                            "nodes"
+                          ]
+                        }
+                      },
+                      "tone": {
+                        "$if": [
+                          {
+                            "$eq": [
+                              {
+                                "$path": "section"
+                              },
+                              "nodes"
+                            ]
+                          },
+                          "primary",
+                          "default"
+                        ]
+                      }
+                    },
+                    {
+                      "type": "button",
+                      "text": "引用与材料",
+                      "on": {
+                        "click": "section"
+                      },
+                      "attrs": {
+                        "data-section": "refs",
+                        "aria-pressed": {
+                          "$eq": [
+                            {
+                              "$path": "section"
+                            },
+                            "refs"
+                          ]
+                        }
+                      },
+                      "tone": {
+                        "$if": [
+                          {
+                            "$eq": [
+                              {
+                                "$path": "section"
+                              },
+                              "refs"
+                            ]
+                          },
+                          "primary",
+                          "default"
+                        ]
+                      }
+                    },
+                    {
+                      "type": "button",
+                      "text": "执行历史",
+                      "on": {
+                        "click": "section"
+                      },
+                      "attrs": {
+                        "data-section": "runs",
+                        "aria-pressed": {
+                          "$eq": [
+                            {
+                              "$path": "section"
+                            },
+                            "runs"
+                          ]
+                        }
+                      },
+                      "tone": {
+                        "$if": [
+                          {
+                            "$eq": [
+                              {
+                                "$path": "section"
+                              },
+                              "runs"
+                            ]
+                          },
+                          "primary",
+                          "default"
+                        ]
+                      }
+                    },
+                    {
+                      "type": "button",
+                      "text": "验收证据",
+                      "on": {
+                        "click": "section"
+                      },
+                      "attrs": {
+                        "data-section": "evidence",
+                        "aria-pressed": {
+                          "$eq": [
+                            {
+                              "$path": "section"
+                            },
+                            "evidence"
+                          ]
+                        }
+                      },
+                      "tone": {
+                        "$if": [
+                          {
+                            "$eq": [
+                              {
+                                "$path": "section"
+                              },
+                              "evidence"
+                            ]
+                          },
+                          "primary",
+                          "default"
+                        ]
+                      }
+                    },
+                    {
+                      "type": "button",
+                      "text": "事件时间线",
+                      "on": {
+                        "click": "section"
+                      },
+                      "attrs": {
+                        "data-section": "events",
+                        "aria-pressed": {
+                          "$eq": [
+                            {
+                              "$path": "section"
+                            },
+                            "events"
+                          ]
+                        }
+                      },
+                      "tone": {
+                        "$if": [
+                          {
+                            "$eq": [
+                              {
+                                "$path": "section"
+                              },
+                              "events"
+                            ]
+                          },
+                          "primary",
+                          "default"
+                        ]
+                      }
+                    },
+                    {
+                      "type": "button",
+                      "text": "项目与安全",
+                      "on": {
+                        "click": "section"
+                      },
+                      "attrs": {
+                        "data-section": "project",
+                        "aria-pressed": {
+                          "$eq": [
+                            {
+                              "$path": "section"
+                            },
+                            "project"
+                          ]
+                        }
+                      },
+                      "tone": {
+                        "$if": [
+                          {
+                            "$eq": [
+                              {
+                                "$path": "section"
+                              },
+                              "project"
+                            ]
+                          },
+                          "primary",
+                          "default"
+                        ]
+                      }
+                    },
+                    {
+                      "type": "button",
+                      "text": "目标与计划",
+                      "on": {
+                        "click": "section"
+                      },
+                      "attrs": {
+                        "data-section": "commands",
+                        "aria-pressed": {
+                          "$eq": [
+                            {
+                              "$path": "section"
+                            },
+                            "commands"
+                          ]
+                        }
+                      },
+                      "tone": {
+                        "$if": [
+                          {
+                            "$eq": [
+                              {
+                                "$path": "section"
+                              },
+                              "commands"
+                            ]
+                          },
+                          "primary",
+                          "default"
+                        ]
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "button",
+              "text": "刷新",
+              "on": {
+                "click": "refresh"
+              },
+              "ref": "refresh",
+              "testId": "fwa-refresh"
+            },
+            {
+              "type": "badge",
+              "ref": "mode",
+              "testId": "fwa-mode",
+              "text": "只读",
+              "hidden": true
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "text": "",
+          "ref": "message",
+          "testId": "fwa-status",
+          "attrs": {
+            "role": "status"
+          }
+        },
+        {
+          "type": "columns",
+          "ref": "body",
+          "columns": 2,
+          "children": [
+            {
+              "type": "card",
+              "children": [
+                {
+                  "type": "heading",
+                  "ref": "panelTitle"
+                },
+                {
+                  "type": "slot",
+                  "ref": "panelActions"
+                },
+                {
+                  "type": "slot",
+                  "ref": "main",
+                  "testId": "fwa-content"
+                }
+              ]
+            },
+            {
+              "type": "card",
+              "ref": "detail",
+              "testId": "fwa-inspector",
+              "attrs": {
+                "aria-label": "选中对象详情"
+              }
+            }
+          ]
+        },
+        {
+          "type": "details",
+          "ref": "history",
+          "testId": "fwa-run-history",
+          "children": [
+            {
+              "type": "summary",
+              "text": "执行记录"
+            },
+            {
+              "type": "slot",
+              "ref": "historyContent"
+            }
+          ]
+        }
+      ]
+    },
+    "summary": {
+      "type": "columns",
+      "columns": 4,
+      "children": [
+        {
+          "type": "template",
+          "template": "metric",
+          "data": {
+            "$path": "summaries.0"
+          }
+        },
+        {
+          "type": "template",
+          "template": "metric",
+          "data": {
+            "$path": "summaries.1"
+          }
+        },
+        {
+          "type": "template",
+          "template": "metric",
+          "data": {
+            "$path": "summaries.2"
+          }
+        },
+        {
+          "type": "template",
+          "template": "metric",
+          "data": {
+            "$path": "summaries.3"
+          }
+        }
+      ]
+    },
+    "metric": {
+      "type": "card",
+      "children": [
+        {
+          "type": "text",
+          "text": {
+            "$path": "label"
+          },
+          "tone": "muted"
+        },
+        {
+          "type": "heading",
+          "text": {
+            "$path": "value"
+          }
+        }
+      ]
+    },
+    "notice": {
+      "type": "text",
+      "text": {
+        "$path": "text"
+      },
+      "tone": {
+        "$path": "tone"
+      }
+    },
+    "boundaries": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "heading",
+          "text": "明确的操作边界"
+        },
+        {
+          "type": "text",
+          "text": "创建目标、加载计划和申请重试可在此提交。执行使用 Work；候选验证、人工验收、采用和撤销在变更详情操作，需要启动时配置项目检查。恢复仍通过 CLI/API 发起。",
+          "tone": "info"
+        },
+        {
+          "type": "text",
+          "text": "重试只重新排队，不会立即执行，也不会重置重试预算。"
+        },
+        {
+          "type": "text",
+          "text": "资料导入与自动规划在“资料与需求”；节点反馈通过版本化计划修订生效。这里保留手工命令入口，不覆盖历史。"
+        }
+      ]
+    },
+    "history": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "toolbar",
+          "children": [
+            {
+              "type": "heading",
+              "text": {
+                "$text": "historyTitle",
+                "vars": {
+                  "scope": {
+                    "$path": "scope"
+                  }
+                }
+              }
+            },
+            {
+              "type": "button",
+              "text": {
+                "$text": "eventHistory"
+              },
+              "on": {
+                "click": "events"
+              }
+            }
+          ]
+        },
+        {
+          "type": "list",
+          "items": {
+            "$path": "runs"
+          },
+          "template": "attempt",
+          "emptyTemplate": "empty",
+          "attrs": {
+            "data-fwa-attempts": true
+          }
+        }
+      ]
+    },
+    "attempt": {
+      "type": "button",
+      "text": "",
+      "on": {
+        "click": "object"
+      },
+      "attrs": {
+        "data-object-type": "runs",
+        "data-object-id": {
+          "$path": "id"
+        }
+      },
+      "children": [
+        {
+          "type": "text",
+          "text": {
+            "$path": "attempt"
+          },
+          "tone": "muted"
+        },
+        {
+          "type": "heading",
+          "text": {
+            "$path": "title"
+          }
+        },
+        {
+          "type": "badge",
+          "text": {
+            "$path": "statusLabel"
+          },
+          "tone": {
+            "$path": "tone"
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "summary"
+          },
+          "tone": "muted"
+        }
+      ]
+    },
+    "empty": {
+      "type": "text",
+      "text": {
+        "$path": "emptyText"
+      },
+      "tone": "muted"
+    },
+    "cards": {
+      "type": "list",
+      "items": {
+        "$path": "items"
+      },
+      "template": "objectCard",
+      "emptyTemplate": "empty",
+      "attrs": {
+        "data-fwa-cards": true,
+        "data-collection": {
+          "$path": "collection"
+        }
+      }
+    },
+    "objectCard": {
+      "type": "button",
+      "text": "",
+      "on": {
+        "click": "object"
+      },
+      "attrs": {
+        "data-object-type": {
+          "$path": "type"
+        },
+        "data-object-id": {
+          "$path": "id"
+        },
+        "aria-pressed": {
+          "$path": "selected"
+        }
+      },
+      "children": [
+        {
+          "type": "image",
+          "visible": {
+            "$path": "image"
+          },
+          "attrs": {
+            "src": {
+              "$path": "image"
+            },
+            "alt": {
+              "$path": "uri"
+            },
+            "loading": "lazy"
+          },
+          "on": {
+            "click": "noop"
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "cover"
+          },
+          "visible": {
+            "$path": "cover"
+          },
+          "tone": "muted"
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "id"
+          },
+          "tone": "muted"
+        },
+        {
+          "type": "heading",
+          "text": {
+            "$path": "title"
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "extra"
+          },
+          "visible": {
+            "$path": "extra"
+          },
+          "tone": "muted"
+        },
+        {
+          "type": "badge",
+          "text": {
+            "$path": "statusLabel"
+          },
+          "tone": {
+            "$path": "tone"
+          },
+          "visible": {
+            "$path": "statusLabel"
+          }
+        },
+        {
+          "type": "row",
+          "visible": {
+            "$path": "isNode"
+          },
+          "children": [
+            {
+              "type": "badge",
+              "text": {
+                "$path": "validity"
+              }
+            },
+            {
+              "type": "badge",
+              "text": {
+                "$path": "integration"
+              }
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "failure"
+          },
+          "visible": {
+            "$path": "failure"
+          },
+          "tone": "danger"
+        }
+      ]
+    },
+    "graph": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "slot",
+          "ref": "graphHost",
+          "testId": {
+            "$path": "graphTestId"
+          },
+          "attrs": {
+            "data-fwa-graph": true
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "note"
+          },
+          "tone": "muted"
+        }
+      ]
+    },
+    "panelActions": {
+      "type": "toolbar",
+      "children": [
+        {
+          "type": "field",
+          "ref": "search",
+          "field": {
+            "label": "搜索当前视图",
+            "path": "search",
+            "type": "text"
+          },
+          "value": {
+            "$path": "search"
+          },
+          "attrs": {
+            "aria-label": "搜索当前视图",
+            "placeholder": {
+              "$path": "searchPlaceholder"
+            }
+          },
+          "visible": {
+            "$path": "searchable"
+          },
+          "on": {
+            "input": "search",
+            "keydown": "locate"
+          }
+        },
+        {
+          "type": "button",
+          "text": {
+            "$path": "toggleLabel"
+          },
+          "on": {
+            "click": "toggle"
+          },
+          "visible": {
+            "$path": "toggleVisible"
+          }
+        },
+        {
+          "type": "button",
+          "text": "适应画布",
+          "on": {
+            "click": "fit"
+          },
+          "visible": {
+            "$path": "isGraph"
+          }
+        },
+        {
+          "type": "button",
+          "text": "开始执行就绪任务",
+          "on": {
+            "click": "work"
+          },
+          "visible": {
+            "$path": "workVisible"
+          },
+          "tone": "primary",
+          "attrs": {
+            "disabled": {
+              "$path": "workDisabled"
+            }
+          }
+        }
+      ]
+    },
+    "goal": {
+      "type": "card",
+      "children": [
+        {
+          "type": "heading",
+          "text": {
+            "$path": "title"
+          }
+        },
+        {
+          "type": "badge",
+          "text": {
+            "$path": "status"
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "request"
+          }
+        },
+        {
+          "type": "slot",
+          "ref": "record"
+        }
+      ]
+    },
+    "safety": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "heading",
+          "text": "安全与占用"
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "message"
+          },
+          "tone": "info"
+        },
+        {
+          "type": "slot",
+          "ref": "record"
+        }
+      ]
+    },
+    "objectHistory": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "heading",
+          "text": {
+            "$path": "title"
+          }
+        },
+        {
+          "type": "slot",
+          "ref": "links"
+        }
+      ]
+    },
+    "integration": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "heading",
+          "text": {
+            "$path": "title"
+          }
+        },
+        {
+          "type": "slot",
+          "ref": "facts"
+        }
+      ]
+    },
+    "objectLink": {
+      "type": "toolbar",
+      "ref": "links"
+    },
+    "goal.create": {
+      "type": "form",
+      "testId": "fwa-goal.create",
+      "attrs": {
+        "data-command-type": "goal.create"
+      },
+      "on": {
+        "submit": "command"
+      },
+      "children": [
+        {
+          "type": "heading",
+          "text": "创建目标"
+        },
+        {
+          "type": "field",
+          "ref": "title",
+          "field": {
+            "label": "目标名称",
+            "path": "title",
+            "schemaPath": "commands.title",
+            "type": "text"
+          },
+          "value": {
+            "$path": "title"
+          },
+          "attrs": {
+            "name": "title",
+            "aria-label": "目标名称"
+          },
+          "on": {
+            "input": "draft"
+          }
+        },
+        {
+          "type": "field",
+          "ref": "request",
+          "field": {
+            "label": "具体请求",
+            "path": "request",
+            "schemaPath": "commands.goalRequest",
+            "type": "textarea"
+          },
+          "value": {
+            "$path": "request"
+          },
+          "attrs": {
+            "name": "request",
+            "aria-label": "具体请求"
+          },
+          "on": {
+            "input": "draft"
+          }
+        },
+        {
+          "type": "button",
+          "ref": "submit",
+          "text": "提交命令",
+          "tone": "primary",
+          "attrs": {
+            "type": "submit",
+            "disabled": {
+              "$path": "disabled"
+            }
+          }
+        },
+        {
+          "type": "text",
+          "text": "",
+          "ref": "result",
+          "attrs": {
+            "role": "status"
+          }
+        }
+      ]
+    },
+    "plan.load": {
+      "type": "form",
+      "testId": "fwa-plan.load",
+      "attrs": {
+        "data-command-type": "plan.load"
+      },
+      "on": {
+        "submit": "command"
+      },
+      "children": [
+        {
+          "type": "heading",
+          "text": "加载计划"
+        },
+        {
+          "type": "field",
+          "ref": "goalId",
+          "field": {
+            "label": "已有目标 ID",
+            "path": "goalId",
+            "schemaPath": "commands.goalId",
+            "type": "text"
+          },
+          "value": {
+            "$path": "goalId"
+          },
+          "attrs": {
+            "name": "goalId",
+            "aria-label": "已有目标 ID"
+          },
+          "on": {
+            "input": "draft"
+          }
+        },
+        {
+          "type": "field",
+          "ref": "plan",
+          "field": {
+            "label": "计划 JSON",
+            "path": "plan",
+            "schemaPath": "commands.plan",
+            "type": "textarea"
+          },
+          "value": {
+            "$path": "plan"
+          },
+          "attrs": {
+            "name": "plan",
+            "aria-label": "计划 JSON"
+          },
+          "on": {
+            "input": "draft"
+          }
+        },
+        {
+          "type": "button",
+          "ref": "submit",
+          "text": "提交命令",
+          "tone": "primary",
+          "attrs": {
+            "type": "submit",
+            "disabled": {
+              "$path": "disabled"
+            }
+          }
+        },
+        {
+          "type": "text",
+          "text": "",
+          "ref": "result",
+          "attrs": {
+            "role": "status"
+          }
+        }
+      ]
+    },
+    "node.retry": {
+      "type": "form",
+      "testId": "fwa-node.retry",
+      "attrs": {
+        "data-command-type": "node.retry"
+      },
+      "on": {
+        "submit": "command"
+      },
+      "children": [
+        {
+          "type": "heading",
+          "text": "申请节点重试"
+        },
+        {
+          "type": "field",
+          "ref": "nodeId",
+          "field": {
+            "label": "已有节点 ID",
+            "path": "nodeId",
+            "schemaPath": "commands.nodeId",
+            "type": "text"
+          },
+          "value": {
+            "$path": "nodeId"
+          },
+          "attrs": {
+            "name": "nodeId",
+            "aria-label": "已有节点 ID"
+          },
+          "on": {
+            "input": "draft"
+          }
+        },
+        {
+          "type": "field",
+          "ref": "reason",
+          "field": {
+            "label": "重试原因",
+            "path": "reason",
+            "schemaPath": "commands.reason",
+            "type": "text"
+          },
+          "value": {
+            "$path": "reason"
+          },
+          "attrs": {
+            "name": "reason",
+            "aria-label": "重试原因"
+          },
+          "on": {
+            "input": "draft"
+          }
+        },
+        {
+          "type": "button",
+          "ref": "submit",
+          "text": "提交命令",
+          "tone": "primary",
+          "attrs": {
+            "type": "submit",
+            "disabled": {
+              "$path": "disabled"
+            }
+          }
+        },
+        {
+          "type": "text",
+          "text": "",
+          "ref": "result",
+          "attrs": {
+            "role": "status"
+          }
+        }
+      ]
+    },
+    "changePicker": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "field",
+          "ref": "changeSelect",
+          "field": {
+            "type": "select",
+            "label": "查看修改",
+            "path": "changeId"
+          },
+          "attrs": {
+            "aria-label": "查看修改"
+          },
+          "on": {
+            "change": "changeSelected"
+          },
+          "visible": {
+            "$not": {
+              "$path": "empty"
+            }
+          }
+        },
+        {
+          "type": "details",
+          "ref": "allChanges",
+          "children": [
+            {
+              "type": "summary",
+              "text": "全部修改"
+            },
+            {
+              "type": "template",
+              "template": "cards",
+              "data": {
+                "items": {
+                  "$path": "items"
+                },
+                "collection": "changeSets",
+                "emptyText": "尚无修改。先提交需求并执行计划。"
+              }
+            }
+          ],
+          "visible": {
+            "$not": {
+              "$path": "empty"
+            }
+          }
+        },
+        {
+          "type": "text",
+          "text": "还没有修改。执行计划后会显示在这里。",
+          "visible": {
+            "$path": "empty"
+          }
+        }
+      ]
+    },
+    "progress": {
+      "type": "stack",
+      "children": [
+        {
+          "type": "list",
+          "items": {
+            "$path": "items"
+          },
+          "template": "progressItem",
+          "emptyTemplate": "progressEmpty"
+        }
+      ]
+    },
+    "progressItem": {
+      "type": "card",
+      "children": [
+        {
+          "type": "heading",
+          "text": {
+            "$path": "title"
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "statusLabel"
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "failure"
+          },
+          "tone": "warning",
+          "visible": {
+            "$path": "failure"
+          }
+        },
+        {
+          "type": "toolbar",
+          "children": [
+            {
+              "type": "button",
+              "text": "查看修改",
+              "visible": {
+                "$path": "changeId"
+              },
+              "attrs": {
+                "data-change-id": {
+                  "$path": "changeId"
+                }
+              },
+              "on": {
+                "click": "progressChange"
+              }
+            },
+            {
+              "type": "button",
+              "text": "任务详情",
+              "attrs": {
+                "data-node-id": {
+                  "$path": "id"
+                }
+              },
+              "on": {
+                "click": "progressNode"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "progressEmpty": {
+      "type": "text",
+      "text": "还没有计划。请先提交需求。"
+    }
+  }
+}

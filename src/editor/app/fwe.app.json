@@ -1,20 +1,21 @@
 {
   "id": "fwa-console",
-  "title": "FWA · 项目控制台",
+  "title": "FWA · 开发工作台",
   "workspace": ".",
-  "extensions": [{ "path": "./extension.cjs", "client": "./console.js" }],
+  "extensions": [{ "path": "./extension.cjs", "client": ["./workbench-model.js", "./navigation.js", "./surface-adapter.js", "./workbench-content.js", "./experiment-panel.js", "./console-style.js", "./workflow-panel.js", "./console.js"] }],
   "domains": [{
     "id": "fwa-projection",
     "title": "FWA 项目",
     "kind": "document",
     "source": { "type": "fwa-projection" },
-    "model": { "root": "" },
-    "view": [{ "type": "form", "view": "fwa-console", "title": "项目控制台" }],
+    "model": { "type": "object", "root": "$", "authority": "fwa-interaction-contract-v1" },
+    "workbench": { "editor": { "configs": { "console": "./console.ui.json", "content": "./content.ui.json", "workflow": "./workflow.ui.json", "experiment": "./experiment.ui.json" } } },
+    "view": [{ "type": "form", "view": "fwa-console", "title": "开发工作台" }],
     "actions": { "toolbar": [], "add": false, "duplicate": false, "delete": false, "undo": false, "redo": false, "save": false, "new": false },
     "inspector": { "summary": false },
     "defaults": { "fileName": "projection.json", "data": {} }
   }],
   "navigation": {
-    "workspaces": [{ "id": "fwa", "label": "FWA", "sections": [{ "id": "project", "label": "项目控制台", "domainId": "fwa-projection", "hideFile": true }] }]
+    "workspaces": [{ "id": "fwa", "label": "FWA", "sections": [{ "id": "project", "label": "开发工作台", "domainId": "fwa-projection", "hideFile": true }] }]
   }
 }

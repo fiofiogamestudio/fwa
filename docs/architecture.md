@@ -25,12 +25,11 @@ verifies that the package has no third-party runtime or development dependency.
 Consequences:
 
 - a game made with `fw` does not need FWA or FWE;
-- V0.1 contains no FWE adapter, FWE UI, or shared FWA/FWE configuration
-  contract;
-- a future FWE surface can consume FWA through an adapter without changing
-  either core;
+- the frozen V0.1 engineering baseline did not include an FWE adapter or UI;
+- the current optional FWE workbench consumes application projections and a
+  bounded command API through `src/editor`, without changing either core;
 - FWA can operate on a plain Git repository through its API or CLI;
-- executors, evaluators, storage ports, and a future UI can be implemented
+- executors, evaluators, storage ports, and UI surfaces can be implemented
   independently while preserving their contracts.
 
 This is a Git-first V0.1, not a repository-neutral workflow engine. Commit ids,
@@ -44,7 +43,7 @@ free.
 ## Layers
 
 ```text
-CLI / future UI
+CLI / optional FWE workbench
        ↓
 FwaApplication
        ↓
@@ -74,6 +73,71 @@ lease ports.
 - `CommandEvaluator` runs deterministic checks without a command shell;
 - `createUnityEvaluatorProfile` supplies Unity compile, EditMode, and NUnit
   result checks to `CommandEvaluator`.
+
+`src/editor` is an optional outer adapter, not a core dependency. It starts
+one explicitly selected independent FWE checkout against one already
+initialized project. The browser never opens `.fwa` paths directly or acquires
+an executor capability merely by showing an action. FWE provides its guarded
+server, view host and reusable graph component; FWA provides application
+queries, its pure visualization projection and workflow-specific views.
+
+## Current visual workbench
+
+The current workbench extends the original CLI-first baseline with reference
+imports, structured planning, isolated Work batches and explicit plan revisions.
+Trusted review configuration also enables candidate validation, recorded human
+acceptance, gated adoption/reversion and same-baseline comparison. It does not
+provide autonomous game acceptance. Usage and verification boundaries are in
+[`interactive-workflow.md`](interactive-workflow.md),
+[`change-review.md`](change-review.md) and [`visual-workbench.md`](visual-workbench.md).
+
+`workbench-model.js` derives the task DAG and Ref graph from the application
+status projection without mutating it. DAG edges run from each prerequisite
+to its dependent. The Ref graph derives only declared `reads`/`writes`; it
+does not invent implemented-by/verified-by relationships or claim that a tool
+actually read a file. Goal filtering removes out-of-scope edges as well as
+nodes. The inspector keeps multiple historical Runs and their bound
+ChangeSets, Evaluations, Evidence, integrations and reversions distinct.
+
+Node `status`, `validity`, and `integrationStatus` are independent dimensions.
+A planned dependent can display a rejected-prerequisite blocker while still
+being planned. A produced Run or an empty ChangeSet is not passing acceptance;
+accepted-but-stale output is not current valid output. Explanatory UI blockers
+do not replace application command validation or authorize execution.
+
+The fixed-project read adapter offers sequence-based event pages, registered
+Ref content, and event-reachable artifact previews. Event pagination uses the
+durable global sequence, including when a Node filter is requested; it is not
+a mutable array index. Ref preview means current workspace bytes, while Run
+effects preserve their declared Ref version snapshots. An observed file hash
+is not a replacement for the Ref version protocol. Image metadata supplies a
+hash-bound raw URL so an intervening edit fails instead of displaying different
+bytes beneath the metadata.
+
+Preview paths reject escape and symlink/junction traversal, require regular
+files, and check identity around bounded reads. Artifact authorization starts
+with complete references in project events and expands only through JSON
+parents whose exact size and SHA-256 have verified. Corrupt or unreadable
+parents do not authorize children. The bounded search may still expose a
+healthy independent branch; failures remain explicit if no authorized route
+can be established. Artifact inspection never runs recovery or cleanup.
+
+The browser preserves local selection and in-page command drafts across
+background updates. A project-scoped `sessionStorage` journal retains
+unacknowledged command IDs across reloads, but it does not persist form drafts
+or provide durable execution control. Explicit write capability exposes the
+bounded application, library and workflow commands. Review and comparison use
+server-selected profiles and durable jobs; browser requests never supply an
+executable. Pending feedback is resolved through an explicit versioned plan
+revision. Recovery remains an explicit CLI/API operation; ordinary workspace
+Ref mutation, pause/resume and authenticated approval are not workbench operations.
+
+The server is a trusted-local-user loopback surface with fixed project identity,
+source fingerprints, Host/Origin guards, and CSRF/fingerprint checks for
+mutations. It is not remote authentication or hostile-code confinement. A
+source change invalidates the running server; start a fresh process rather
+than hot-replacing code. Fence and lease panels are snapshots, not an implicit
+integrity check or permission to clear a blocker.
 
 ## Durable model
 
@@ -334,10 +398,16 @@ Implemented engine integration is a deterministic Unity evaluation-profile
 adapter: project/editor validation, batch compile, EditMode tests, and strict
 NUnit result validation. It is not the V0.2 Game Runtime abstraction.
 
-V0.1 intentionally excludes automatic planning, vector/embedding/RAG knowledge
-systems, agent or reviewer swarms, parallel scheduling, an FWE adapter or UI,
-shared FWA/FWE configuration, authenticated human approval, hostile-code
+The frozen V0.1 acceptance scope excluded an FWE adapter, UI and web dashboard;
+the current optional workbench above is a later outer-adapter addition, not a
+retroactive claim about that validation snapshot. It does not add shared
+FWA/FWE core configuration or a complete graphical control plane.
+
+The frozen V0.1 scope excluded automatic planning, an FWE UI and parallel
+scheduling; these are now implemented additions described above. Current work
+still excludes vector/embedding/RAG knowledge systems, agent or reviewer swarms,
+authenticated human approval, hostile-code
 confinement, PlayMode/runtime scenarios, screenshots, video, telemetry,
 semantic/behavioral/visual conflict detection, caching, automated game design,
-learning, cloud/distributed execution, web dashboards, and multiple engine
+learning, cloud/distributed execution, and multiple engine
 adapters.

@@ -104,7 +104,7 @@ test('editor requires an explicit compatible FWE and never initializes an uninit
 
 test('editor read-only virtual source returns the real projection and generic CRUD cannot mutate it', integration, async (t) => {
   const { root, application } = await project(t);
-  await application.createGoal({ title: '<img src=x onerror=alert(1)>', commandId: 'seed-goal' });
+  const goal = (await application.createGoal({ title: '<img src=x onerror=alert(1)>', commandId: 'seed-goal' })).goal;
   const before = await snapshot(path.join(root, '.fwa'));
   const instance = await editor(t, root);
   const publicApp = (await request(instance, '/api/app')).body;
@@ -119,7 +119,7 @@ test('editor read-only virtual source returns the real projection and generic CR
   assert.equal(session.fingerprint, instance.fingerprint);
   assert.match(session.launchRevision, /^fwe-launch-v1:[a-f0-9]{64}$/);
   const list = await request(instance, '/api/domains/fwa-projection/files');
-  assert.deepEqual(list.body.files.map((item) => item.name), ['projection.json']);
+  assert.deepEqual(list.body.files.map((item) => item.name), ['projection.json', `objects/goals/${encodeURIComponent(goal.id)}.json`]);
   const resource = await request(instance, '/api/domains/fwa-projection/files/projection.json');
   assert.deepEqual(resource.body.data, await application.getStatus());
   const status = await request(instance, '/api/fwa/status');

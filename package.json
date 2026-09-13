@@ -22,6 +22,7 @@
     "fwa": "bin/fwa.js"
   },
   "scripts": {
+    "start": "node tools/start-editor.mjs",
     "check": "node tools/check.js",
     "test": "node --import ./tools/test-environment.js --test --test-concurrency=1",
     "validate:v01:live": "node tools/validate-v01-live.mjs",
