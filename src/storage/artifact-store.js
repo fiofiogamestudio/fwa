@@ -6,6 +6,7 @@ import {
   open,
   readFile,
   readdir,
+  realpath,
   unlink
 } from 'node:fs/promises';
 import path from 'node:path';
@@ -16,6 +17,10 @@ const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
 const SHARD_PATTERN = /^[a-f0-9]{2}$/;
 const TEMP_FILE_PATTERN = /^\.artifact-([a-f0-9]{64})-([0-9a-f-]+)\.tmp$/i;
 const UNLINK_RETRY_DELAYS = Object.freeze([5, 10, 20, 40, 80]);
+// All instances in this process share a gate for the same physical store. A
+// public read may recover/scan the tree too, so serializing only put is unsafe.
+// This is not a cross-process lock and creates no persistent ownership state.
+const storeOperations = new Map();
 
 export class ArtifactStoreError extends Error {
   constructor(message, code, options = {}) {
@@ -46,13 +51,17 @@ export class ArtifactStore {
   }
 
   async init() {
+    return this.#withStoreOperation(() => this.#init());
+  }
+
+  async #init() {
     await assertRealDirectory(this.projectRoot, 'project root');
     await ensureRealDirectory(this.stateDirectory, 0o700, 'FWA state directory');
     const created = !(await pathExists(this.artifactsDirectory));
     await ensureRealDirectory(this.artifactsDirectory, 0o700, 'artifact directory');
     await ensureRealDirectory(this.hashDirectory, 0o700, 'SHA-256 artifact directory');
-    const recovery = await this.recoverPublishedTemps();
-    const verification = await this.verify();
+    const recovery = await this.#recoverPublishedTemps();
+    const verification = await this.#verifyPrepared();
     return { created, recovery, ...verification };
   }
 
@@ -61,9 +70,15 @@ export class ArtifactStore {
    * concurrent writer from replacing an already-addressed artifact.
    */
   async put(value) {
-    await this.#assertInitialized();
-    await this.recoverPublishedTemps();
+    // Snapshot before waiting for the gate; the caller may reuse its buffer as
+    // soon as put returns a promise, while another publication is still active.
     const bytes = snapshotBytes(value);
+    return this.#withStoreOperation(() => this.#put(bytes));
+  }
+
+  async #put(bytes) {
+    await this.#assertInitialized();
+    await this.#recoverPublishedTemps();
     const digest = digestBytes(bytes);
     const ref = createArtifactRef(digest, bytes.byteLength);
     await this.#assertSafeTree();
@@ -115,8 +130,12 @@ export class ArtifactStore {
   }
 
   async get(ref) {
+    return this.#withStoreOperation(() => this.#get(ref));
+  }
+
+  async #get(ref) {
     await this.#assertInitialized();
-    await this.recoverPublishedTemps();
+    await this.#recoverPublishedTemps();
     const normalized = validateArtifactRef(ref);
     await this.#assertSafeTree();
     const artifactPath = this.#pathFor(normalized.digest);
@@ -125,8 +144,18 @@ export class ArtifactStore {
 
   /** Verify one ref, or scan and verify the complete store when ref is omitted. */
   async verify(ref) {
+    return this.#withStoreOperation(() => this.#verify(ref));
+  }
+
+  async #verify(ref) {
     await this.#assertInitialized();
-    await this.recoverPublishedTemps();
+    await this.#recoverPublishedTemps();
+    return this.#verifyPrepared(ref);
+  }
+
+  // These prepared helpers run only inside the current operation's store gate,
+  // after its path checks and recovery. Nothing is retained across public calls.
+  async #verifyPrepared(ref) {
     if (ref !== undefined) {
       const normalized = validateArtifactRef(ref);
       await this.#assertSafeTree();
@@ -134,7 +163,7 @@ export class ArtifactStore {
       return { ok: true, ref: normalized };
     }
 
-    const refs = await this.listRefs();
+    const refs = await this.#listRefsPrepared();
     return {
       ok: true,
       artifactCount: refs.length,
@@ -148,8 +177,16 @@ export class ArtifactStore {
    * hashed again before its ref is returned.
    */
   async listRefs() {
+    return this.#withStoreOperation(() => this.#listRefs());
+  }
+
+  async #listRefs() {
     await this.#assertInitialized();
-    await this.recoverPublishedTemps();
+    await this.#recoverPublishedTemps();
+    return this.#listRefsPrepared();
+  }
+
+  async #listRefsPrepared() {
     const entries = await this.#scanTree();
     const refs = [];
     for (const entry of entries) {
@@ -169,6 +206,10 @@ export class ArtifactStore {
    * equal bytes in a copied file are deliberately insufficient evidence.
    */
   async recoverPublishedTemps() {
+    return this.#withStoreOperation(() => this.#recoverPublishedTemps());
+  }
+
+  async #recoverPublishedTemps() {
     await this.#assertInitialized();
     const recovered = [];
     let shards;
@@ -223,6 +264,22 @@ export class ArtifactStore {
       }
     }
     return { recoveredCount: recovered.length, recovered };
+  }
+
+  async #withStoreOperation(operation) {
+    // Resolve parent aliases as well as Windows casing. Invalid roots still go
+    // through the original path validation inside the guarded operation.
+    const root = await realpath(this.projectRoot).catch(() => this.projectRoot);
+    const directory = path.join(root, '.fwa', 'artifacts');
+    const key = process.platform === 'win32' ? directory.toLowerCase() : directory;
+    const result = (storeOperations.get(key) ?? Promise.resolve()).then(operation);
+    const settled = result.catch(() => {});
+    storeOperations.set(key, settled);
+    try {
+      return await result;
+    } finally {
+      if (storeOperations.get(key) === settled) storeOperations.delete(key);
+    }
   }
 
   async #assertInitialized() {

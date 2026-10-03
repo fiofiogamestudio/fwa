@@ -121,6 +121,62 @@ test('atomically appends ordered batches and verifies the hash chain', async (t)
   });
 });
 
+test('batch read-ahead preserves exact event and command order across several windows', async (t) => {
+  const { store } = await fixture(t), expected = [];
+  for (let sequence = 1; sequence <= 9; sequence += 1) {
+    const item = event(sequence, sequence % 3 === 0 ? 'large'.repeat(20000) : String(sequence));
+    expected.push(await append(store, `command-${sequence}`, [item], sequence - 1));
+  }
+  const state = await store.readAll();
+  assert.deepEqual(state.batches, expected.map(result => result.batch));
+  assert.deepEqual(state.events, expected.flatMap(result => result.batch.events));
+  assert.equal(state.lastBatchHash, expected.at(-1).batch.hash);
+  assert.equal(state.lastSequence, 9);
+});
+
+test('batch read-ahead reports the earliest integrity failure before a later JSON failure', async (t) => {
+  for (const [firstBad, laterBad] of [[2, 4], [5, 8]]) {
+    await t.test(`corrupt batch ${firstBad} before malformed batch ${laterBad}`, async subtest => {
+      const { store, eventsDirectory } = await fixture(subtest);
+      for (let sequence = 1; sequence <= 8; sequence += 1) {
+        await append(store, `command-${sequence}`, [event(sequence)], sequence - 1);
+      }
+      const names = await batchFiles(eventsDirectory);
+      await rewriteBatch(eventsDirectory, names[firstBad - 1], batch => { batch.events[0].payload.suffix = 'tampered'; });
+      await writeFile(path.join(eventsDirectory, names[laterBad - 1]), '{invalid JSON');
+      const firstFailure = error => error.code === 'payload-hash-mismatch' && error.message.includes(names[firstBad - 1]);
+      await assert.rejects(store.readAll(), firstFailure);
+      await assert.rejects(store.verify(), firstFailure);
+      await assert.rejects(append(store, 'after-corruption', [event(9)], 8), firstFailure);
+      assert.equal((await store.inspectLock()).held, false, 'failed append releases its own writer lock');
+      assert.deepEqual(await batchFiles(eventsDirectory), names, 'failed verification publishes no transaction');
+    });
+  }
+});
+
+test('a filename sequence gap takes priority over that prefetched file being malformed', async t => {
+  const { store, eventsDirectory } = await fixture(t);
+  for (let sequence = 1; sequence <= 7; sequence += 1) {
+    await append(store, `command-${sequence}`, [event(sequence)], sequence - 1);
+  }
+  const names = await batchFiles(eventsDirectory);
+  await unlink(path.join(eventsDirectory, names[4]));
+  await writeFile(path.join(eventsDirectory, names[5]), '{invalid JSON');
+  await assert.rejects(store.readAll(), error => error.code === 'batch-sequence-gap'
+    && error.details.expected === 5 && error.details.actual === 6);
+});
+
+test('a later read verifies previously read batches again and detects new corruption', async t => {
+  const { store, eventsDirectory } = await fixture(t);
+  for (let sequence = 1; sequence <= 6; sequence += 1) {
+    await append(store, `command-${sequence}`, [event(sequence)], sequence - 1);
+  }
+  assert.equal((await store.readAll()).lastSequence, 6);
+  const names = await batchFiles(eventsDirectory);
+  await rewriteBatch(eventsDirectory, names[5], batch => { batch.events[0].payload.suffix = 'changed after read'; });
+  await assert.rejects(store.readAll(), error => error.code === 'payload-hash-mismatch');
+});
+
 test('returns the recorded batch for the same command intent without comparing regenerated events', async (t) => {
   const { store, eventsDirectory } = await fixture(t);
   const commandIntent = { type: 'goal.create', title: 'Build it' };

@@ -16,6 +16,7 @@ export const FILE_EVENT_STORE_SCHEMA_VERSION = 1;
 const GENESIS_HASH = '0'.repeat(64);
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const BATCH_FILE_PATTERN = /^batch-(\d{16})\.json$/;
+const BATCH_READ_CONCURRENCY = 4;
 const LOCK_TEMP_FILE_PATTERN = /^\.lock\.[0-9a-f-]+\.tmp$/i;
 const LOCK_FILE_NAME = '.lock';
 const LOCK_SCHEMA_VERSION = 1;
@@ -952,31 +953,40 @@ export class FileEventStore {
     let expectedEventSequence = 1;
     let previousHash = GENESIS_HASH;
 
-    for (const file of batchFiles) {
-      if (file.batchSequence !== expectedBatchSequence) {
-        throw new FileEventStoreError(
-          `Event batch sequence gap: expected ${expectedBatchSequence}, found ${file.batchSequence}.`,
-          'batch-sequence-gap',
-          { details: { expected: expectedBatchSequence, actual: file.batchSequence } }
-        );
+    for (let offset = 0; offset < batchFiles.length; offset += BATCH_READ_CONCURRENCY) {
+      const window = batchFiles.slice(offset, offset + BATCH_READ_CONCURRENCY);
+      // Bound disk reads, but consume every result in journal order. A later
+      // read/JSON failure must never mask an earlier sequence or hash failure.
+      const reads = await Promise.allSettled(window.map(file =>
+        readBatch(path.join(this.eventsDirectory, file.name))));
+      for (let index = 0; index < window.length; index += 1) {
+        const file = window[index];
+        if (file.batchSequence !== expectedBatchSequence) {
+          throw new FileEventStoreError(
+            `Event batch sequence gap: expected ${expectedBatchSequence}, found ${file.batchSequence}.`,
+            'batch-sequence-gap',
+            { details: { expected: expectedBatchSequence, actual: file.batchSequence } }
+          );
+        }
+
+        if (reads[index].status === 'rejected') throw reads[index].reason;
+        const batch = reads[index].value;
+        validatePersistedBatch({
+          batch,
+          fileName: file.name,
+          expectedBatchSequence,
+          expectedEventSequence,
+          previousHash,
+          commandIds
+        });
+
+        batches.push(batch);
+        events.push(...batch.events);
+        commandIds.add(batch.commandId);
+        expectedBatchSequence += 1;
+        expectedEventSequence = batch.lastSequence + 1;
+        previousHash = batch.hash;
       }
-
-      const batch = await readBatch(path.join(this.eventsDirectory, file.name));
-      validatePersistedBatch({
-        batch,
-        fileName: file.name,
-        expectedBatchSequence,
-        expectedEventSequence,
-        previousHash,
-        commandIds
-      });
-
-      batches.push(batch);
-      events.push(...batch.events);
-      commandIds.add(batch.commandId);
-      expectedBatchSequence += 1;
-      expectedEventSequence = batch.lastSequence + 1;
-      previousHash = batch.hash;
     }
 
     return {

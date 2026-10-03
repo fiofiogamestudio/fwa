@@ -266,6 +266,28 @@ test('releases and stale-archives v1 run leases while exposing mapped owners', a
   );
 });
 
+test('init fences a live atomic-update temp before classifying orphan transactions', async (t) => {
+  const item = await fixture(t);
+  await item.lease.acquire({ runId: 'live-heartbeat', pid: process.pid });
+  const guardPath = path.join(item.stateDirectory, '.workspace-lease.guard');
+  const tempPath = path.join(item.stateDirectory, `.workspace-lease.${LEASE_ID_1}.${GUARD_ID_2}.tmp`);
+  const currentBytes = await readFile(item.leasePath);
+  // Hold the exact public on-disk phase of heartbeat: a live operation guard,
+  // the canonical lease and a fully written update awaiting atomic publication.
+  await writeFile(guardPath, `${JSON.stringify(guardRecord({ pid: process.pid }))}\n`, { flag: 'wx' });
+  await writeFile(tempPath, currentBytes, { flag: 'wx' });
+  await assert.rejects(item.lease.init(), error => error.code === 'workspace-lease-busy');
+  assert.deepEqual(await readFile(tempPath), currentBytes);
+  assert.deepEqual(await readFile(item.leasePath), currentBytes);
+  await unlink(guardPath);
+  // With no live operation protecting it, the same unfinished temp really is
+  // orphaned and must still fail closed without being removed by init.
+  await assert.rejects(item.lease.init(), error => error.code === 'orphan-temporary-lease');
+  assert.deepEqual(await readFile(tempPath), currentBytes);
+  await unlink(tempPath);
+  assert.equal((await item.lease.init()).held, true);
+});
+
 test('heartbeats atomically and rejects the wrong lease id or owner token', async (t) => {
   const item = await fixture(t);
   await item.lease.acquire({ runId: 'run-1', pid: 1234 });

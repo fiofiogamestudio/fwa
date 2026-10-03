@@ -92,8 +92,9 @@ export class WorkspaceLease {
     await ensureRealDirectory(this.stateDirectory, 0o700, 'FWA state directory');
     const archiveCreated = !(await pathExists(this.archiveDirectory));
     await ensureRealDirectory(this.archiveDirectory, 0o700, 'lease archive directory');
-    await this.#assertNoOrphanTemps();
-
+    // inspect performs orphan detection only after acquiring the operation
+    // guard. A scan here could mistake another owner's live heartbeat temp for
+    // an orphan between its fsync and atomic rename.
     const inspection = await this.inspect();
     return {
       created: stateCreated || archiveCreated,
@@ -439,7 +440,16 @@ export class WorkspaceLease {
   }
 
   async #archiveDeadGuard() {
-    const expected = await this.#readGuard();
+    let expected;
+    try { expected = await this.#readGuard(); }
+    catch (error) {
+      // The owner can finish after our EEXIST collision, before lstat or read.
+      // We hold no guard yet: use the existing bounded publication retry. Its
+      // exclusive link still fences any replacement owner; do not remove it.
+      if (error.cause?.code === 'ENOENT'
+        && ['lease-guard-read-failed', 'workspace-lease-guard-corruption'].includes(error.code)) return true;
+      throw error;
+    }
     let ownerAlive;
     try {
       ownerAlive = await this.pidProbe(expected.pid);

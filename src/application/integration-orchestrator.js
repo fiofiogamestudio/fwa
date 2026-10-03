@@ -21,7 +21,7 @@ import {
 import { hashCanonicalValue } from '../storage/file-event-store.js';
 import { loadProject } from './project.js';
 import { projectEvents } from './projection.js';
-import { settleLeaseOperation, startLeaseHeartbeat } from './lease-operations.js';
+import { retryUnstartedLeaseOperation, startLeaseHeartbeat } from './lease-operations.js';
 import { areNodeDependenciesSatisfied } from '../core/scheduling.js';
 import { runIntegrationRegressionGate } from './integration-regression-gate.js';
 
@@ -1095,7 +1095,7 @@ export class IntegrationOrchestrator {
       );
     }
 
-    await settleLeaseOperation(lease, () => lease.init());
+    await retryUnstartedLeaseOperation(lease, () => lease.init());
     await artifacts.init();
     const integrationId = this.#id('integration');
     let capability;
@@ -1104,7 +1104,7 @@ export class IntegrationOrchestrator {
     const cleanup = { leaseReleased: false, warnings: [] };
 
     try {
-      capability = await settleLeaseOperation(lease, () => lease.acquire({
+      capability = await retryUnstartedLeaseOperation(lease, () => lease.acquire({
         ownerKind: 'integration',
         ownerId: integrationId,
         ttlMs
@@ -1265,7 +1265,7 @@ export class IntegrationOrchestrator {
     } finally {
       if (capability) {
         try {
-          await settleLeaseOperation(lease, () => lease.release({
+          await retryUnstartedLeaseOperation(lease, () => lease.release({
             leaseId: capability.lease.leaseId,
             ownerToken: capability.ownerToken
           }));
@@ -1367,7 +1367,7 @@ export class IntegrationOrchestrator {
       );
     }
 
-    await settleLeaseOperation(lease, () => lease.init());
+    await retryUnstartedLeaseOperation(lease, () => lease.init());
     await artifacts.init();
     const integrationId = this.#id('integration');
     let capability;
@@ -1382,7 +1382,7 @@ export class IntegrationOrchestrator {
       warnings: []
     };
     try {
-      capability = await settleLeaseOperation(lease, () => lease.acquire({
+      capability = await retryUnstartedLeaseOperation(lease, () => lease.acquire({
         ownerKind: 'integration',
         ownerId: integrationId,
         ttlMs
@@ -1735,7 +1735,7 @@ export class IntegrationOrchestrator {
       }
       if (capability) {
         try {
-          await settleLeaseOperation(lease, () => lease.release({
+          await retryUnstartedLeaseOperation(lease, () => lease.release({
             leaseId: capability.lease.leaseId,
             ownerToken: capability.ownerToken
           }));
@@ -1836,7 +1836,7 @@ export class IntegrationOrchestrator {
       );
     }
 
-    await settleLeaseOperation(lease, () => lease.init());
+    await retryUnstartedLeaseOperation(lease, () => lease.init());
     await artifacts.init();
     const reversionId = this.#id('reversion');
     let capability;
@@ -1851,7 +1851,7 @@ export class IntegrationOrchestrator {
       warnings: []
     };
     try {
-      capability = await settleLeaseOperation(lease, () => lease.acquire({
+      capability = await retryUnstartedLeaseOperation(lease, () => lease.acquire({
         ownerKind: 'reversion',
         ownerId: reversionId,
         ttlMs
@@ -2182,7 +2182,7 @@ export class IntegrationOrchestrator {
       }
       if (capability) {
         try {
-          await settleLeaseOperation(lease, () => lease.release({
+          await retryUnstartedLeaseOperation(lease, () => lease.release({
             leaseId: capability.lease.leaseId,
             ownerToken: capability.ownerToken
           }));
@@ -2230,7 +2230,7 @@ export class IntegrationOrchestrator {
       'orphanGraceMs',
       DEFAULT_ORPHAN_GRACE_MS
     );
-    await settleLeaseOperation(lease, () => lease.init());
+    await retryUnstartedLeaseOperation(lease, () => lease.init());
     await artifacts.init();
     let state = await this.#readState();
     const conflictingRun = state.projection.runs.find(isActiveRun);
@@ -2252,7 +2252,7 @@ export class IntegrationOrchestrator {
       };
     }
     let active = (state.projection.reversions ?? []).find(isActiveReversion);
-    let leaseInspection = await settleLeaseOperation(lease, () => lease.inspect());
+    let leaseInspection = await retryUnstartedLeaseOperation(lease, () => lease.inspect());
     let archived = null;
     if (leaseInspection.held) {
       if (leaseInspection.lease.ownerKind !== 'reversion') {
@@ -2273,7 +2273,7 @@ export class IntegrationOrchestrator {
           lease: leaseInspection
         };
       }
-      archived = await settleLeaseOperation(lease, () => lease.archiveStale({
+      archived = await retryUnstartedLeaseOperation(lease, () => lease.archiveStale({
         expectedLeaseId: leaseInspection.lease.leaseId
       }));
     }
@@ -2326,7 +2326,7 @@ export class IntegrationOrchestrator {
     const candidateOwnerId = active.id;
     const candidateWorkspacePath = active.candidateWorkspacePath;
     try {
-      capability = await settleLeaseOperation(lease, () => lease.acquire({
+      capability = await retryUnstartedLeaseOperation(lease, () => lease.acquire({
         ownerKind: 'reversion',
         ownerId: active.id
       }));
@@ -2515,7 +2515,7 @@ export class IntegrationOrchestrator {
       }
       if (capability) {
         try {
-          await settleLeaseOperation(lease, () => lease.release({
+          await retryUnstartedLeaseOperation(lease, () => lease.release({
             leaseId: capability.lease.leaseId,
             ownerToken: capability.ownerToken
           }));
@@ -2563,7 +2563,7 @@ export class IntegrationOrchestrator {
       'orphanGraceMs',
       DEFAULT_ORPHAN_GRACE_MS
     );
-    await settleLeaseOperation(lease, () => lease.init());
+    await retryUnstartedLeaseOperation(lease, () => lease.init());
     await artifacts.init();
     let state = await this.#readState();
     const conflictingRun = state.projection.runs.find(isActiveRun);
@@ -2580,7 +2580,7 @@ export class IntegrationOrchestrator {
       };
     }
     let active = (state.projection.integrations ?? []).find(isActiveIntegration);
-    let leaseInspection = await settleLeaseOperation(lease, () => lease.inspect());
+    let leaseInspection = await retryUnstartedLeaseOperation(lease, () => lease.inspect());
     let archived = null;
     if (leaseInspection.held) {
       if (leaseInspection.lease.ownerKind !== 'integration') {
@@ -2601,10 +2601,10 @@ export class IntegrationOrchestrator {
           lease: leaseInspection
         };
       }
-      archived = await settleLeaseOperation(lease, () => lease.archiveStale({
+      archived = await retryUnstartedLeaseOperation(lease, () => lease.archiveStale({
         expectedLeaseId: leaseInspection.lease.leaseId
       }));
-      leaseInspection = await settleLeaseOperation(lease, () => lease.inspect());
+      leaseInspection = await retryUnstartedLeaseOperation(lease, () => lease.inspect());
     }
     if (!active) {
       const cleanup = {
@@ -2656,7 +2656,7 @@ export class IntegrationOrchestrator {
     const candidateWorkspacePath = active.candidateWorkspacePath;
     const candidateCleanupRequired = active.strategy === GATED_MERGE_STRATEGY;
     try {
-      capability = await settleLeaseOperation(lease, () => lease.acquire({
+      capability = await retryUnstartedLeaseOperation(lease, () => lease.acquire({
         ownerKind: 'integration',
         ownerId: active.id
       }));
@@ -2832,7 +2832,7 @@ export class IntegrationOrchestrator {
       }
       if (capability) {
         try {
-          await settleLeaseOperation(lease, () => lease.release({
+          await retryUnstartedLeaseOperation(lease, () => lease.release({
             leaseId: capability.lease.leaseId,
             ownerToken: capability.ownerToken
           }));
@@ -4350,8 +4350,8 @@ export class IntegrationOrchestrator {
         { integrationId, status: integration.status }
       );
     }
-    await settleLeaseOperation(lease, () => lease.init());
-    const inspection = await settleLeaseOperation(lease, () => lease.inspect());
+    await retryUnstartedLeaseOperation(lease, () => lease.init());
+    const inspection = await retryUnstartedLeaseOperation(lease, () => lease.inspect());
     const stillOwnsLease = inspection.held
       && inspection.lease.ownerKind === 'integration'
       && inspection.lease.ownerId === integrationId;
@@ -4386,8 +4386,8 @@ export class IntegrationOrchestrator {
         { reversionId, status: reversion.status }
       );
     }
-    await settleLeaseOperation(lease, () => lease.init());
-    const inspection = await settleLeaseOperation(lease, () => lease.inspect());
+    await retryUnstartedLeaseOperation(lease, () => lease.init());
+    const inspection = await retryUnstartedLeaseOperation(lease, () => lease.inspect());
     const stillOwnsLease = inspection.held
       && inspection.lease.ownerKind === 'reversion'
       && inspection.lease.ownerId === reversionId;

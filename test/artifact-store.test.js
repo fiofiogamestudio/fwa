@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import {
   mkdir,
@@ -12,6 +13,7 @@ import {
 } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { syncBuiltinESMExports } from 'node:module';
 import test from 'node:test';
 import {
   ArtifactStore,
@@ -91,6 +93,72 @@ test('concurrent identical writes converge without replacing content', async (t)
   );
 });
 
+test('live publications serialize reads and writes across instances without blocking another store', { timeout: 30000 }, async t => {
+  const { root, store } = await fixture(t), independent = await fixture(t);
+  const peer = new ArtifactStore(process.platform === 'win32' ? root.toUpperCase() : root);
+  const retained = await store.put('existing content');
+  const originalOpen = fs.promises.open;
+  let release, opened, held = false, completed = 0, writer;
+  const pending = [];
+  const publishGate = new Promise(resolve => { release = resolve; });
+  const publicationStarted = new Promise(resolve => { opened = resolve; });
+  const abort = () => { release(); opened(); };
+  t.signal.addEventListener('abort', abort, { once: true });
+  fs.promises.open = async (...args) => {
+    const file = await originalOpen(...args);
+    if (!held && args[1] === 'wx' && String(args[0]).endsWith('.tmp')
+      && path.resolve(String(args[0])).startsWith(`${root}${path.sep}`)) {
+      held = true; opened();
+      await publishGate;
+    }
+    return file;
+  };
+  syncBuiltinESMExports();
+  try {
+    writer = store.put('concurrent payload');
+    await Promise.race([publicationStarted, writer.then(() => assert.fail('The writer did not expose a publication window.'))]);
+    const source = Buffer.from('before');
+    const track = operation => {
+      const result = operation.then(value => { completed++; return value; });
+      pending.push(result); return result;
+    };
+    const sameContent = track(peer.put('concurrent payload'));
+    const snapshotted = track(peer.put(source));
+    source.fill(0);
+    const currentRead = track(store.get(retained)), peerRead = track(peer.get(retained));
+    track(peer.verify()); track(store.listRefs()); track(peer.recoverPublishedTemps()); track(peer.init());
+    // This must finish while the first store's publication remains paused.
+    // The test timeout releases the gate, so a broken global queue cannot hang.
+    const independentRef = await independent.store.put('unrelated store');
+    assert.equal((await independent.store.get(independentRef)).toString(), 'unrelated store');
+    assert.equal(completed, 0, 'All operations on the publishing store must wait instead of scanning its temporary file.');
+    release();
+    const first = await writer;
+    await Promise.all(pending);
+    assert.deepEqual(await sameContent, first);
+    assert.equal((await store.get(await snapshotted)).toString(), 'before', 'The queued input was snapshotted at invocation.');
+    assert.equal((await currentRead).toString(), 'existing content');
+    assert.equal((await peerRead).toString(), 'existing content');
+    assert.equal((await store.verify()).artifactCount, 3);
+  } finally {
+    release();
+    fs.promises.open = originalOpen;
+    syncBuiltinESMExports();
+    t.signal.removeEventListener('abort', abort);
+    await Promise.allSettled([writer, ...pending].filter(Boolean));
+  }
+});
+
+test('a rejected operation releases the shared store queue for the next instance', async t => {
+  const { root, store } = await fixture(t), peer = new ArtifactStore(root);
+  const missing = createArtifactRef(digest('not present'), 11);
+  const outcomes = await Promise.allSettled([store.get(missing), peer.put('later publication')]);
+  assert.equal(outcomes[0].status, 'rejected');
+  assert.equal(outcomes[0].reason.code, 'artifact-not-found');
+  assert.equal(outcomes[1].status, 'fulfilled');
+  assert.equal((await store.get(outcomes[1].value)).toString(), 'later publication');
+});
+
 test('recovers a publication temp only when it is a hardlink to the final artifact', async (t) => {
   const { store, hashDirectory } = await fixture(t);
   const ref = await store.put('published bytes');
@@ -106,6 +174,65 @@ test('recovers a publication temp only when it is a hardlink to the final artifa
   assert.equal(verification.ok, true);
   assert.equal((await readdir(shard)).includes(path.basename(tempPath)), false);
   assert.equal((await store.get(ref)).toString('utf8'), 'published bytes');
+});
+
+test('init reports recovered publications and checks later tampering instead of reusing earlier verification', async t => {
+  const { store, hashDirectory } = await fixture(t);
+  const content = 'retained publication', ref = await store.put(content);
+  const finalPath = artifactPath(hashDirectory, ref.digest);
+  const tempPath = path.join(path.dirname(finalPath), `.artifact-${ref.digest}-33333333-3333-4333-8333-333333333333.tmp`);
+  await link(finalPath, tempPath);
+  assert.deepEqual(await store.init(), { created: false,
+    recovery: { recoveredCount: 1, recovered: [tempPath] }, ok: true, artifactCount: 1, totalBytes: ref.size });
+  assert.deepEqual((await store.init()).recovery, { recoveredCount: 0, recovered: [] });
+
+  await writeFile(finalPath, 'tampered publication');
+  for (const operation of [() => store.init(), () => store.verify()]) {
+    await assert.rejects(operation(), error => error.code === 'artifact-corruption');
+  }
+  await writeFile(finalPath, content);
+  // Copied bytes still do not establish that a leftover temporary file is safe.
+  await writeFile(tempPath, content);
+  await assert.rejects(store.init(), error => error.code === 'orphan-temporary-artifact');
+  assert.equal(await readFile(tempPath, 'utf8'), content);
+});
+
+test('full-store init and verification bound directory traversal while hashing every artifact on each call', async t => {
+  const { root, store, hashDirectory } = await fixture(t);
+  const refs = await Promise.all(['first object', 'second object', 'third object'].map(value => store.put(value)));
+  const artifactFiles = refs.map(ref => artifactPath(hashDirectory, ref.digest));
+  const directories = [hashDirectory, ...new Set(artifactFiles.map(file => path.dirname(file)))];
+  const originalReaddir = fs.promises.readdir, originalReadFile = fs.promises.readFile;
+  let visits, reads;
+  fs.promises.readdir = async (...args) => {
+    const result = await originalReaddir(...args), target = path.resolve(String(args[0]));
+    if (target.startsWith(`${root}${path.sep}`)) visits.set(target, (visits.get(target) ?? 0) + 1);
+    return result;
+  };
+  fs.promises.readFile = async (...args) => {
+    const result = await originalReadFile(...args), target = path.resolve(String(args[0]));
+    if (target.startsWith(`${root}${path.sep}`)) reads.set(target, (reads.get(target) ?? 0) + 1);
+    return result;
+  };
+  syncBuiltinESMExports();
+  try {
+    for (const operation of [() => store.init(), () => store.verify()]) {
+      visits = new Map(); reads = new Map();
+      const result = await operation();
+      assert.equal(result.artifactCount, refs.length);
+      assert.equal(result.totalBytes, refs.reduce((total, ref) => total + ref.size, 0));
+      for (const directory of directories) {
+        assert.ok(visits.get(directory) >= 1 && visits.get(directory) <= 2,
+          'Full verification needs one recovery pass and one complete safety inventory, not nested recovery passes.');
+      }
+      assert.deepEqual([...reads.keys()].sort(), [...artifactFiles].sort());
+      assert.ok([...reads.values()].every(count => count === 1), 'Every public full verification must hash all current bytes once.');
+    }
+  } finally {
+    fs.promises.readdir = originalReaddir;
+    fs.promises.readFile = originalReadFile;
+    syncBuiltinESMExports();
+  }
 });
 
 test('never recovers a copied artifact temp merely because its bytes match', async (t) => {

@@ -13,7 +13,7 @@ import {
 import { hashCanonicalValue } from '../storage/file-event-store.js';
 import { loadProject } from './project.js';
 import { projectEvents } from './projection.js';
-import { settleLeaseOperation, startLeaseHeartbeat } from './lease-operations.js';
+import { retryUnstartedLeaseOperation, startLeaseHeartbeat } from './lease-operations.js';
 
 const DEFAULT_LEASE_TTL_MS = 30_000;
 const DEFAULT_ORPHAN_GRACE_MS = 5_000;
@@ -650,7 +650,7 @@ export class EvaluationOrchestrator {
       );
     }
 
-    await settleLeaseOperation(lease, () => lease.init());
+    await retryUnstartedLeaseOperation(lease, () => lease.init());
     await artifacts.init();
     const evaluationId = this.#id('evaluation');
     let capability;
@@ -667,7 +667,7 @@ export class EvaluationOrchestrator {
     };
 
     try {
-      capability = await settleLeaseOperation(lease, () => lease.acquire({
+      capability = await retryUnstartedLeaseOperation(lease, () => lease.acquire({
         ownerKind: 'evaluation',
         ownerId: evaluationId,
         ttlMs
@@ -932,7 +932,7 @@ export class EvaluationOrchestrator {
     } finally {
       if (capability && releaseLease) {
         try {
-          await settleLeaseOperation(lease, () => lease.release({
+          await retryUnstartedLeaseOperation(lease, () => lease.release({
             leaseId: capability.lease.leaseId,
             ownerToken: capability.ownerToken
           }));
@@ -961,7 +961,7 @@ export class EvaluationOrchestrator {
       ? this.#id('command')
       : requirePublicCommandId(correlationId);
     const graceMs = requireSafeDuration(orphanGraceMs, 'orphanGraceMs', DEFAULT_ORPHAN_GRACE_MS);
-    await settleLeaseOperation(lease, () => lease.init());
+    await retryUnstartedLeaseOperation(lease, () => lease.init());
     let state = await this.#readState();
     const activeRun = state.projection.runs.find(isActiveRun);
     if (activeRun) {
@@ -1007,7 +1007,7 @@ export class EvaluationOrchestrator {
       [EvaluationStatus.PASSED, EvaluationStatus.REJECTED].includes(evaluation.status)
       && ['cleanup-pending', 'cleanup-failed'].includes(evaluation.workspaceStatus)
     ));
-    let inspection = await settleLeaseOperation(lease, () => lease.inspect());
+    let inspection = await retryUnstartedLeaseOperation(lease, () => lease.inspect());
     let archived = null;
     if (inspection.held) {
       if (inspection.lease.ownerKind !== 'evaluation') {
@@ -1030,10 +1030,10 @@ export class EvaluationOrchestrator {
           lease: inspection
         };
       }
-      archived = await settleLeaseOperation(lease, () => lease.archiveStale({
+      archived = await retryUnstartedLeaseOperation(lease, () => lease.archiveStale({
         expectedLeaseId: inspection.lease.leaseId
       }));
-      inspection = await settleLeaseOperation(lease, () => lease.inspect());
+      inspection = await retryUnstartedLeaseOperation(lease, () => lease.inspect());
     }
     if (!active && !cleanupCandidate) {
       return {
@@ -1092,7 +1092,7 @@ export class EvaluationOrchestrator {
     let capability;
     let reconciliationCleanup = null;
     try {
-      capability = await settleLeaseOperation(lease, () => lease.acquire({
+      capability = await retryUnstartedLeaseOperation(lease, () => lease.acquire({
         ownerKind: 'evaluation',
         ownerId: candidate.id
       }));
@@ -1161,7 +1161,7 @@ export class EvaluationOrchestrator {
       return { ok: true, reconciled: false, reason: 'evaluation-state-changed' };
     } finally {
       if (capability) {
-        await settleLeaseOperation(lease, () => lease.release({
+        await retryUnstartedLeaseOperation(lease, () => lease.release({
           leaseId: capability.lease.leaseId,
           ownerToken: capability.ownerToken
         }));
@@ -1438,8 +1438,8 @@ export class EvaluationOrchestrator {
         { evaluationId, status: evaluation.status }
       );
     }
-    await settleLeaseOperation(lease, () => lease.init());
-    const inspection = await settleLeaseOperation(lease, () => lease.inspect());
+    await retryUnstartedLeaseOperation(lease, () => lease.init());
+    const inspection = await retryUnstartedLeaseOperation(lease, () => lease.inspect());
     const stillOwnsLease = inspection.held
       && inspection.lease.ownerKind === 'evaluation'
       && inspection.lease.ownerId === evaluationId;
