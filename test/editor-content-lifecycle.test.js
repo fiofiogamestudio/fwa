@@ -102,40 +102,38 @@ async function createContent(api, status = { refs: [], nodes: [] }, select = () 
   return window.FwaWorkbenchContent.create({ api, getStatus: () => status, select, ...options });
 }
 
-test('review controls bind the observed candidate token, preserve review drafts and disable unavailable actions', integration, async () => {
+test('finish binds the observed candidate token, requires passing evidence capability and needs no manual note', integration, async () => {
   const state = { nodes: [{ id: 'node-1', title: 'One behavior' }], changeSets: [{ id: 'change-1', nodeId: 'node-1', changedFiles: ['feature.js'] }], evidence: [] };
-  const review = { reviewToken: 'a'.repeat(64), profiles: [{ id: 'real-checks' }], actions: { validate: true, accept: false, integrate: false, revert: false },
-    jobs: [], blockers: [], impact: { nodes: [], explanation: 'Declared dependencies only.' } };
+  const review = { reviewToken: 'a'.repeat(64), profiles: [{ id: 'real-checks' }], actions: { validate: true, finish: false, revert: false }, jobs: [], blockers: [], impact: { nodes: [] } };
   const calls = [];
-  const content = await createContent(async () => review, state, () => {}, {
-    command: async (...args) => { calls.push(args); }, getSession: () => ({ allowWrite: true })
-  });
+  const content = await createContent(async () => review, state, () => {}, { command: async (...args) => calls.push(args), getSession: () => ({ allowWrite: true }) });
   const host = new Element('aside'); host.connectedRoot = true;
-  content.changeSet(host, 'change-1'); await new Promise(resolve => setImmediate(resolve));
-  assert.ok(descendants(host).some(item => item.dataset.testid === 'fwa-change-review'), host.textContent);
-  const buttons = descendants(host).filter(item => item.dataset.action);
-  assert.deepEqual(buttons.map(item => item.disabled), [false, true, true, true]);
-  assert.deepEqual(buttons.slice(0, 3).map(item => item.hidden), [false, true, true]);
-  review.evidenceId = 'verified-evidence'; review.actions.accept = true;
-  host.replaceChildren(); content.changeSet(host, 'change-1'); await new Promise(resolve => setImmediate(resolve));
-  const note = descendants(host).find(item => item.name === 'acceptanceNote');
-  note.value = 'A user observation of the actual behavior'; note.dispatch('input');
-  const impact = descendants(host).find(item => item.tagName === 'DETAILS' && item.textContent.includes('撤销此项：查看依赖影响'));
-  impact.open = true;
-  descendants(host).find(item => item.dataset.action === 'accept').dispatch('click'); await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [['change.accept', { changeSetId: 'change-1', reviewToken: 'a'.repeat(64), note: note.value }]]);
-  host.replaceChildren(); content.changeSet(host, 'change-1'); await new Promise(resolve => setImmediate(resolve));
-  assert.equal(descendants(host).find(item => item.name === 'acceptanceNote').value, note.value);
-  assert.equal(descendants(host).find(item => item.name === 'revertNote').value, '', 'acceptance must not silently become the reason for reversion');
-  const reopened = descendants(host).find(item => item.tagName === 'DETAILS' && item.textContent.includes('撤销此项：查看依赖影响'));
-  assert.equal(reopened.open, true, 'automatic refresh must preserve the dependency disclosure during reversion');
-  reopened.open = false;
-  review.current = false; review.reverted = true; review.accepted = true;
-  host.replaceChildren(); content.changeSet(host, 'change-1'); await new Promise(resolve => setImmediate(resolve));
-  assert.ok(descendants(host).some(item => item.tagName === 'H3' && item.textContent === '已撤销'));
-  assert.equal(descendants(host).find(item => item.tagName === 'DETAILS' && item.textContent.includes('撤销此项：查看依赖影响')).open, false);
-  assert.doesNotMatch(host.textContent, /人工验收已记录 · 待采用/);
-  assert.equal(descendants(host).filter(item => item.dataset.action && !item.hidden && item.dataset.action !== 'revert').length, 0);
+  const render = async () => { host.replaceChildren(); content.changeSet(host, 'change-1'); await new Promise(resolve => setImmediate(resolve)); };
+  await render();
+  let finish = descendants(host).find(item => item.dataset.action === 'finish');
+  assert.equal(finish.hidden, true); assert.equal(finish.disabled, true);
+  assert.equal(descendants(host).some(item => item.name === 'acceptanceNote'), false);
+  review.evidenceId = 'passing-evidence'; await render();
+  finish = descendants(host).find(item => item.dataset.action === 'finish'); assert.equal(finish.disabled, true);
+  finish.dispatch('click'); await new Promise(resolve => setImmediate(resolve)); assert.equal(calls.length, 0);
+  review.actions.finish = true; await render();
+  finish = descendants(host).find(item => item.dataset.action === 'finish'); assert.equal(finish.disabled, false); assert.equal(finish.hidden, false);
+  finish.dispatch('click'); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [['workflow.finish', { changeSetId: 'change-1', reviewToken: 'a'.repeat(64) }]]);
+  assert.equal(descendants(host).some(item => item.name === 'profileId' || item.dataset.action === 'validate'), false);
+  review.completionMode = 'automatic'; review.autoFinishAllowed = false; await render();
+  finish = descendants(host).find(item => item.dataset.action === 'finish'); assert.equal(finish.hidden, true);
+  assert.match(host.textContent, /工作台顶部“继续”/);
+  finish.dispatch('click'); await new Promise(resolve => setImmediate(resolve)); assert.equal(calls.length, 1);
+  review.completionMode = 'manual'; review.autoFinishAllowed = true; await render();
+  assert.equal(descendants(host).find(item => item.dataset.action === 'finish').hidden, false, 'The policy, not instantaneous admission, controls the human gate.');
+  review.integrated = true; review.actions.finish = false; await render();
+  assert.equal(descendants(host).find(item => item.dataset.action === 'finish').hidden, true);
+  const note = descendants(host).find(item => item.name === 'revertNote'); note.value = 'Observed regression'; note.dispatch('input');
+  const impact = descendants(host).find(item => item.tagName === 'DETAILS' && item.textContent.includes('撤销此项：查看依赖影响')); impact.open = true;
+  await render();
+  assert.equal(descendants(host).find(item => item.name === 'revertNote').value, 'Observed regression');
+  assert.equal(descendants(host).find(item => item.tagName === 'DETAILS' && item.textContent.includes('撤销此项：查看依赖影响')).open, true);
   content.dispose();
 });
 
@@ -151,14 +149,27 @@ test('review failure remains visible without opening technical operation history
   assert.doesNotMatch(host.textContent, /运行项目配置中的检查，结果会绑定/); content.dispose();
 });
 
-test('localized change labels preserve typed diff rendering', integration, async () => {
+test('candidate diff loads only on expansion, stays inside the selected node and preserves expansion across refresh', integration, async () => {
   const digest = 'd'.repeat(64), patch = '--- a/counter.js\n+++ b/counter.js\n-module.exports = 0;\n+module.exports = 1;\n';
-  const state = { nodes: [{ id: 'n', title: 'Counter' }], changeSets: [{ id: 'c', nodeId: 'n', changedFiles: ['counter.js'], patchArtifact: { digest, size: patch.length } }], evidence: [] };
-  const content = await createContent(async () => ({ digest, size: patch.length, text: patch, format: 'text' }), state);
+  const state = { nodes: [{ id: 'n', title: 'Counter', changeSetIds: ['c'] }], changeSets: [{ id: 'c', nodeId: 'n', changedFiles: ['counter.js'], patchArtifact: { digest, size: patch.length } }], evidence: [] };
+  const reads = [], selections = [];
+  const content = await createContent(async url => { reads.push(url); return { digest, size: patch.length, text: patch, format: 'text' }; }, state, (...args) => selections.push(args));
   const host = new Element('aside'); host.connectedRoot = true;
-  content.changeSet(host, 'c'); await new Promise(resolve => setImmediate(resolve));
+  content.node(host, 'n'); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads.length, 0);
+  const disclosure = descendants(host).find(item => item.dataset.testid === 'fwa-candidate-diff');
+  disclosure.open = true; disclosure.dispatch('toggle'); await new Promise(resolve => setImmediate(resolve));
   const diff = descendants(host).find(item => item.dataset.testid === 'fwa-diff');
   assert.ok(diff); assert.ok(diff.children.some(line => line.className === 'fwa-diff-add'));
+  assert.equal(reads.length, 1); assert.equal(selections.length, 0);
+  host.replaceChildren(); content.node(host, 'n');
+  const refreshed = descendants(host).find(item => item.dataset.testid === 'fwa-candidate-diff');
+  assert.equal(refreshed.open, true); assert.equal(descendants(host).find(item => item.dataset.testid === 'fwa-diff'), diff);
+  assert.equal(reads.length, 1);
+  refreshed.open = false; refreshed.dispatch('toggle'); host.replaceChildren(); content.node(host, 'n');
+  assert.equal(descendants(host).find(item => item.dataset.testid === 'fwa-candidate-diff').open, false);
+  host.replaceChildren(); content.changeSet(host, 'c');
+  assert.equal(reads.length, 1, 'The compatible independent resource view is also lazy.');
   assert.match(host.textContent, /文件差异/); content.dispose();
 });
 
@@ -318,7 +329,9 @@ test('document rendering preserves untrusted markup as inert text', integration,
 test('Node, Run and ChangeSet compositions render through the current FWE Surface without legacy controls', integration, async () => {
   const state = {
     goals: [{ id: 'goal-1', title: 'A goal', status: 'active' }],
-    nodes: [{ id: 'node-1', goalId: 'goal-1', title: 'A running node', status: 'running', validity: 'valid', reads: ['ref-1'], writes: [], dependsOn: [], budget: { maxRetries: 2 } }],
+    nodes: [{ id: 'node-1', goalId: 'goal-1', title: 'A running node', instruction: 'Full technical implementation instructions',
+      acceptance: { commands: ['compile'], checks: ['feature-check-id'] }, status: 'running', validity: 'valid',
+      reads: ['ref-1'], writes: [], dependsOn: [], budget: { maxRetries: 2 } }],
     refs: [{ id: 'ref-1', uri: 'brief.md', kind: 'doc', version: 'v1' }],
     runs: [{ id: 'run-1', nodeId: 'node-1', status: 'failed', summary: 'Execution failed', failure: { code: 'EXEC', message: 'Failed', details: { process: { stderr: 'sandbox unavailable' } } } }],
     changeSets: [{ id: 'change-1', nodeId: 'node-1', runId: 'run-1', changedFiles: [] }],
@@ -328,6 +341,12 @@ test('Node, Run and ChangeSet compositions render through the current FWE Surfac
   const host = new Element('aside'); host.connectedRoot = true;
   content.node(host, 'node-1');
   assert.match(host.textContent, /A running node/);
+  assert.equal(descendants(host).filter(item => item.tagName === 'H3' && item.textContent === 'A running node').length, 1);
+  assert.doesNotMatch(host.textContent, /当前为只读模式|旧计划未单列结果说明/);
+  const acceptance = descendants(host).find(item => item.dataset.testid === 'fwa-node-acceptance');
+  assert.equal(acceptance.open, false); assert.match(acceptance.textContent, /验收标准（2）/);
+  assert.match(acceptance.textContent, /compile/); assert.match(acceptance.textContent, /feature-check-id/);
+  assert.ok(descendants(host).filter(item => item.tagName === 'BUTTON' && /执行此节点|继续验证此节点/.test(item.textContent)).every(item => item.hidden));
   assert.ok(descendants(host).some(item => item.dataset.tone === 'info'));
   assert.ok(descendants(host).some(item => item.dataset.resourceId === 'ref-1'));
   host.replaceChildren(); content.run(host, 'run-1');

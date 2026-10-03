@@ -118,8 +118,8 @@ try {
   page.on('pageerror', error => report.errors.push(error.message));
   page.on('console', event => { if (event.type() === 'error') report.errors.push(event.text()); });
   await page.goto(instance.url);
-  await expect(page.getByTestId('fwa-status')).toContainText('已连接');
-  await expect(page.getByTestId('fwa-mode')).toContainText('只读');
+  await expect(page.getByTestId('fwa-refresh')).toBeEnabled();
+  await expect(page.getByText('只读预览', { exact: true })).toBeVisible();
   const graph = page.getByTestId('fwa-dag');
   await expect(graph.locator('[data-node-id]')).toHaveCount(4);
   await expect(graph.locator('[data-edge-id]')).toHaveCount(4);
@@ -134,9 +134,10 @@ try {
   passed('actual workbench renders the four-edge diamond; join follows both predecessors and selects its inspector');
 
   await expect.poll(() => page.evaluate(() => window.fwe.navigation.current().fileName)).toBe('objects/nodes/join.json');
-  const newPage = page.waitForEvent('popup');
-  await page.getByTestId('fwa-inspector').getByRole('link', { name: '在新窗口打开此对象', exact: true }).click();
-  const objectPage = await newPage;
+  await page.getByTestId('fwa-inspector').locator('summary').filter({ hasText: /^对象链接$/ }).click();
+  const selfLink = page.getByTestId('fwa-inspector').getByRole('link', { name: '单独打开此记录', exact: true });
+  await expect(selfLink).toBeVisible();
+  const [objectPage] = await Promise.all([page.waitForEvent('popup'), selfLink.click()]);
   await expect(objectPage.getByTestId('fwa-inspector').getByRole('heading', { name: 'Integration join / 双前驱汇合', exact: true })).toBeVisible();
   await objectPage.reload();
   await expect(objectPage.getByTestId('fwa-inspector').getByRole('heading', { name: 'Integration join / 双前驱汇合', exact: true })).toBeVisible();
@@ -154,16 +155,31 @@ try {
   const transform = await graph.locator('.fg-world').evaluate(node => node.style.transform);
   await application.createGoal({ title: 'External refresh while inspecting graph', commandId: 'graph-refresh' });
   expected = await application.getStatus();
+  const refreshedStatus = page.waitForResponse(response => response.url().includes('/api/fwa/status?view=summary') && response.ok());
   await page.getByTestId('fwa-refresh').click();
-  await expect(page.getByTestId('fwa-status')).toContainText(`事件 #${expected.lastSequence}`);
+  assert.equal((await (await refreshedStatus).json()).lastSequence, expected.lastSequence);
+  await expect(page.getByTestId('fwa-refresh')).toBeEnabled();
   await expect(graph.locator('[data-node-id="join"]')).toHaveAttribute('aria-pressed', 'true');
   assert.equal(await graph.locator('.fg-world').evaluate(node => node.style.transform), transform);
   passed('real external event update preserves graph selection and manually adjusted pan/zoom');
 
-  await page.locator('[data-section="runs"]').click();
-  await page.getByTestId('fwa-content').locator(attr('data-object-id', run.id)).click();
+  async function openRun() {
+    const back = page.getByTestId('fwa-inspector').getByRole('button', { name: '← 返回任务节点', exact: true });
+    if (await back.isVisible()) await back.click();
+    const prepare = graph.locator('[data-node-id="prepare"]');
+    if (!await prepare.count()) await page.getByRole('button', { name: '查看全图', exact: true }).click();
+    await prepare.click();
+    const technical = page.getByTestId('fwa-node-detail').locator('[data-fwa-node-technical]');
+    if (!await technical.evaluate(element => element.open)) await technical.locator(':scope > summary').click();
+    const runPath = encodeURIComponent(`objects/runs/${encodeURIComponent(run.id)}.json`);
+    const link = technical.locator(`a.fwe-resource-link[href*=${JSON.stringify(runPath)}]`);
+    await expect(link).toHaveCount(1); await link.click();
+    await expect.poll(() => page.evaluate(() => window.fwe.navigation.current().fileName)).toBe(`objects/runs/${encodeURIComponent(run.id)}.json`);
+  }
+  await openRun();
   await expect(page.getByTestId('fwa-inspector')).toContainText('file-operations');
   await page.getByTestId('fwa-inspector').getByRole('link', { name: `3 个文件 · ${change.id.slice(0, 12)}`, exact: true }).click();
+  await page.getByTestId('fwa-candidate-diff').locator(':scope > summary').click();
   const diff = page.getByTestId('fwa-diff');
   await expect(diff).toBeVisible();
   assert.equal(await diff.textContent(), patch.endsWith('\n') ? patch + '\n' : patch);
@@ -177,8 +193,7 @@ try {
   await writeFile(path.join(output, 'diff-dom.txt'), await page.getByTestId('fwa-inspector').ariaSnapshot());
   passed('Run links to its exact ChangeSet; browser displays real added/deleted lines and the complete immutable patch');
 
-  await page.locator('[data-section="runs"]').click();
-  await page.getByTestId('fwa-content').locator(attr('data-object-id', run.id)).click();
+  await openRun();
   await page.getByTestId('fwa-inspector').getByRole('link', { name: `通过 · ${evidence.kind}`, exact: true }).click();
   const criterion = page.getByTestId('fwa-criteria').locator('[data-criterion="fixture-content"]');
   await expect(criterion).toContainText('通过');
@@ -186,25 +201,29 @@ try {
   await expect(page.getByTestId('fwa-artifact-text')).toContainText('FIXTURE_PATCH_VERIFIED');
   await page.screenshot({ path: path.join(output, '03-evidence-output.png'), fullPage: true });
   await page.getByTestId('fwa-inspector').getByRole('link', { name: '定位变更集', exact: true }).click();
+  const returnedDiff = page.getByTestId('fwa-candidate-diff');
+  if (!await returnedDiff.evaluate(element => element.open)) await returnedDiff.locator(':scope > summary').click();
   await expect(page.getByTestId('fwa-diff')).toContainText('+VERIFIED_LINE_ADDED');
   passed('Run links to its actual passing Evidence; output log loads; Evidence returns to the same ChangeSet');
 
-  await page.locator('[data-section="events"]').click();
-  const events = page.getByTestId('fwa-events').locator(':scope > [role=listitem]');
-  await expect(events).toHaveCount(100);
-  await page.getByRole('button', { name: '加载更多事件', exact: true }).click();
-  await expect(events).toHaveCount(expected.eventCount);
-  let sequences = await events.locator('[data-event-sequence]').allTextContents();
+  // The single-page workbench no longer has an event tab. Keep the durable
+  // pagination contract through its real HTTP query without inventing a UI route.
+  async function eventPage(after = 0) {
+    const response = await page.request.get(`${instance.url}/api/fwa/events?after=${after}&limit=100`);
+    assert.equal(response.status(), 200); return response.json();
+  }
+  const firstEvents = await eventPage(); assert.equal(firstEvents.events.length, 100); assert.equal(firstEvents.hasMore, true);
+  const nextEvents = await eventPage(firstEvents.nextSequence);
+  let sequences = [...firstEvents.events, ...nextEvents.events].map(event => event.sequence);
   assert.equal(new Set(sequences).size, expected.eventCount);
-  assert.deepEqual(sequences, (await application.listEvents()).map(event => `#${event.sequence}`));
+  assert.deepEqual(sequences, (await application.listEvents()).map(event => event.sequence));
   await application.createGoal({ title: 'Timeline appended after second page', commandId: 'timeline-refresh' });
   expected = await application.getStatus();
-  await page.getByTestId('fwa-refresh').click();
-  await expect(events).toHaveCount(expected.eventCount);
-  sequences = await events.locator('[data-event-sequence]').allTextContents();
-  assert.deepEqual(sequences, (await application.listEvents()).map(event => `#${event.sequence}`));
-  await page.screenshot({ path: path.join(output, '04-events-refreshed.png'), fullPage: false });
-  passed('timeline loads two pages in durable sequence and appends a real new event on refresh without duplicates');
+  const appendedEvents = await eventPage(nextEvents.nextSequence);
+  sequences.push(...appendedEvents.events.map(event => event.sequence));
+  assert.deepEqual(sequences, (await application.listEvents()).map(event => event.sequence));
+  await writeFile(path.join(output, '04-events-http.json'), JSON.stringify({ firstEvents, nextEvents, appendedEvents }, null, 2));
+  passed('HTTP event query loads two durable pages and appends a real new event without duplicates; retired event-tab UI is not asserted');
 
   assert.deepEqual(report.errors, []);
   assert.deepEqual(await application.getStatus(), expected, 'Browser inspection must not mutate FWA project state.');

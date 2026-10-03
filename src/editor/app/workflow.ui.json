@@ -5,9 +5,9 @@
     "selectLibrary": "规划使用当前版本：{label}",
     "stopReason": "停止原因：{stopReason}",
     "selectLibraries": "使用的资料（最多 {maxReferenceLibraries} 个）",
-    "groupPhase": "阶段：{phase}；分组是展示结构，不是独立执行器。",
+    "groupPhase": "当前状态：{phase}。此分组汇总下方任务。",
     "imported": "已导入",
-    "importUnconfirmed": "导入响应没有资料库标识，请刷新核对；不能据此声称导入成功。",
+    "importUnconfirmed": "导入结果未确认，请刷新核对。",
     "planned": "已提交",
     "permissionSaved": "权限已保存",
     "accessRead": "只读",
@@ -18,7 +18,7 @@
     "jobInterrupted": "已中断 / 结果未确认",
     "jobSucceeded": "已返回",
     "jobQuestions": "需要补充信息",
-    "zeroChange": "未产生文件改动，需核对执行日志。可能是无需修改，也可能是执行受阻；不能据此认定任务完成。",
+    "zeroChange": "未产生文件改动，需核对执行日志。",
     "zeroRun": "零改动 Run：{runId} · ChangeSet：{changeSetId}",
     "permissionExplicit": "此路径显式设置",
     "permissionInherited": "继承自 {source}",
@@ -30,13 +30,12 @@
     "mediaUnsupported": "此类型或大小暂不支持正文预览。导入副本和版本仍已保留。",
     "readContent": "正在校验并读取副本…",
     "readTree": "读取目录树…",
-    "feedbackSaved": "反馈已记录，等待明确的计划修订；尚未改变结果。",
-    "revisionSaved": "已提交重新规划作业；只有修订成功记录后才视为反馈已应用。",
+    "feedbackSaved": "补充要求已保存，尚未调整任务图。",
+    "revisionSaved": "正在调整任务图。",
     "revisionNeedsFeedback": "需要当前计划版本和 1–{maxRevisionFeedback} 条待处理反馈。请刷新核对。",
     "requestFailed": "请求失败：{error}",
-    "historicalNode": "这是历史或已移出当前计划的节点；请在当前节点版本提交反馈，历史结果不会被改写。",
-    "activeOperation": "项目有活动或待恢复操作；反馈可以提交，需等待运行、验收、集成与回退操作结束后才能修订计划。",
-    "feedbackBoundary": "修改请求与已完成结果分开保存。",
+    "historicalNode": "这是历史任务，请选择当前版本调整。",
+    "activeOperation": "当前操作未结束，可先暂存要求。",
     "feedbackPending": "待处理 · 尚未生效",
     "feedbackState": "状态：{status} · {revision}",
     "seeRevision": "请查看修订记录"
@@ -45,22 +44,14 @@
     "request": {
       "schemaPath": "commands.request",
       "type": "textarea",
-      "label": "你想改什么？",
-      "rows": 4
-    },
-    "mode": {
-      "schemaPath": "commands.mode",
-      "label": "执行方式",
-      "optionLabels": {
-        "plan": "仅生成计划（默认）",
-        "work": "生成计划后开始执行"
-      }
+      "label": "新任务需求",
+      "rows": 2
     },
     "feedback": {
       "schemaPath": "commands.feedback",
       "type": "textarea",
-      "label": "节点修改建议",
-      "rows": 5
+      "label": "补充要求",
+      "rows": 3
     },
     "permission": {
       "schemaPath": "commands.permission",
@@ -123,7 +114,7 @@
               },
               "attrs": {
                 "aria-label": "需求描述",
-                "placeholder": "例如：降低镜头震动，其他效果保持不变。"
+                "placeholder": "描述新任务希望达成的结果，以及必须保留的限制。"
               },
               "on": {
                 "input": "requestChanged"
@@ -238,35 +229,6 @@
               ]
             },
             {
-              "type": "details",
-              "ref": "settings",
-              "attrs": {
-                "open": {
-                  "$path": "settingsOpen"
-                }
-              },
-              "children": [
-                {
-                  "type": "summary",
-                  "text": "执行设置"
-                },
-                {
-                  "type": "field",
-                  "field": "mode",
-                  "ref": "mode",
-                  "value": {
-                    "$path": "mode"
-                  },
-                  "attrs": {
-                    "aria-label": "规划模式"
-                  },
-                  "on": {
-                    "change": "modeChanged"
-                  }
-                }
-              ]
-            },
-            {
               "type": "text",
               "text": {
                 "$path": "planningBlocker"
@@ -277,11 +239,15 @@
               }
             },
             {
-              "type": "stack",
+              "type": "details",
               "visible": {
                 "$path": "needsReviewSetup"
               },
               "children": [
+                {
+                  "type": "summary",
+                  "text": "执行条件未配置"
+                },
                 {
                   "type": "text",
                   "text": "未配置项目检查，暂不能验证、采用或撤销修改。",
@@ -421,7 +387,7 @@
     "noJobs": {
       "type": "text",
       "tone": "muted",
-      "text": "尚无作业。提交规划后会在这里显示真实状态。"
+      "text": "尚无请求。"
     },
     "job": {
       "type": "card",
@@ -782,7 +748,7 @@
       }
     },
     "feedback": {
-      "type": "card",
+      "type": "details",
       "testId": "fwa-node-feedback",
       "attrs": {
         "data-node-id": {
@@ -791,13 +757,8 @@
       },
       "children": [
         {
-          "type": "heading",
-          "text": "对此节点提出修改"
-        },
-        {
-          "type": "text",
-          "tone": "info",
-          "text": "消息提交后是待处理请求，不会直接改写正在运行的尝试或已完成结果。修订生成新计划版本，不自动执行。"
+          "type": "summary",
+          "text": { "$path": "summary", "default": "调整此任务" }
         },
         {
           "type": "field",
@@ -819,7 +780,8 @@
             {
               "type": "button",
               "ref": "submit",
-              "text": "提交待处理反馈",
+              "text": "暂存补充要求",
+              "visible": { "$path": "submitVisible" },
               "attrs": {
                 "disabled": {
                   "$path": "submitDisabled",
@@ -833,7 +795,7 @@
             {
               "type": "button",
               "ref": "revise",
-              "text": "按待处理反馈修订计划",
+              "text": "按补充要求调整图",
               "attrs": {
                 "disabled": {
                   "$path": "reviseDisabled",
@@ -842,7 +804,8 @@
               },
               "on": {
                 "click": "revise"
-              }
+              },
+              "tone": "primary"
             }
           ]
         },

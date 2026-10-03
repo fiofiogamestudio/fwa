@@ -60,6 +60,7 @@ const measure = async name => {
     const box = element.getBoundingClientRect(); const css = getComputedStyle(element);
     return { tag: element.tagName.toLowerCase(), label: element.getAttribute('aria-label') || element.textContent.trim().replace(/\s+/g, ' ').slice(0, 100),
       testId: element.getAttribute('data-testid'), section: element.getAttribute('data-section'),
+      graphControl: Boolean(element.closest('.fwe-graph-component')), graphToolbar: Boolean(element.closest('.fg-toolbar')),
       type: element.getAttribute('type'), className: element.className, width: box.width, height: box.height, top: box.top, bottom: box.bottom,
       fontSize: css.fontSize, lineHeight: css.lineHeight, padding: css.padding, rows: element.rows || null };
   }));
@@ -68,9 +69,12 @@ const shot = async name => {
   const file = `${name}-1280x800.png`; await page.screenshot({ path: path.join(output, file), fullPage: false }); report.screenshots.push(file);
 };
 const checkControls = name => {
-  const controls = report.measurements[name].filter(item => ['button', 'select', 'input'].includes(item.tag) && !['checkbox', 'radio', 'file', 'range', 'color'].includes(item.type));
+  const controls = report.measurements[name].filter(item => !item.graphControl && ['button', 'select', 'input'].includes(item.tag) && !['checkbox', 'radio', 'file', 'range', 'color'].includes(item.type));
   assert.ok(controls.length > 0);
   for (const item of controls) { assert.equal(item.height, 36, `${name}: ${item.label} height`); assert.equal(item.fontSize, '14px', `${name}: ${item.label} font`); }
+  const graphToolbar = report.measurements[name].filter(item => item.graphToolbar && item.tag === 'button');
+  assert.equal(graphToolbar.length, 3);
+  for (const item of graphToolbar) { assert.equal(item.height, 28, `${name}: ${item.label} graph height`); assert.equal(item.fontSize, '14px', `${name}: ${item.label} graph font`); }
   for (const item of report.measurements[name].filter(item => item.className === 'field__label')) {
     assert.equal(item.fontSize, '12px', `${name}: ${item.label} label font`); assert.equal(item.lineHeight, '16px', `${name}: ${item.label} label line height`);
   }
@@ -82,27 +86,34 @@ try {
   page.on('pageerror', error => report.errors.push(error.message));
   await page.goto(editor.url);
   await expect(page.getByTestId('fwa-refresh')).toBeEnabled({ timeout: 20000 });
-  await expect(page.getByTestId('fwa-workflow-intake')).toBeVisible();
-  await expect(page.getByLabel('需求描述', { exact: true })).toHaveAttribute('rows', '4');
-  await expect(page.getByRole('button', { name: '需求', exact: true })).toHaveAttribute('data-tone', 'primary');
+  const newTask = page.getByText('新建任务', { exact: true });
+  await expect(newTask).toBeVisible();
+  await expect(page.getByTestId('fwa-workflow-intake')).toBeHidden();
+  await expect(page.getByRole('button', { name: '继续', exact: true })).toHaveCount(1);
+  for (const name of ['需求', '修改', '进度']) await expect(page.getByRole('button', { name, exact: true })).toHaveCount(0);
   await measure('default'); await shot('01-default'); checkControls('default');
-  const prompt = report.measurements.default.find(item => item.tag === 'textarea');
-  assert.equal(prompt.fontSize, '14px'); assert.equal(prompt.lineHeight, '20px'); assert.equal(prompt.height, 98);
-  const nav = report.measurements.default.filter(item => ['intake', 'changeSets', 'progress'].includes(item.section) || item.tag === 'summary' && item.label === '高级');
-  assert.equal(nav.length, 4); assert.ok(Math.max(...nav.map(item => item.bottom)) - Math.min(...nav.map(item => item.bottom)) < 1);
-  passed('requirement controls use shared 36px / 14px dimensions, a 4-row prompt, and aligned navigation');
-  const mode = page.getByLabel('规划模式', { exact: true });
-  const modeDetails = mode.locator('xpath=ancestor::details[1]');
-  await modeDetails.locator(':scope > summary').click(); await expect(mode).toBeVisible();
-  await measure('settings'); checkControls('settings');
-  passed('expanded execution settings retain the same select and button dimensions');
-  await page.getByRole('button', { name: '修改', exact: true }).click();
-  await expect(page.getByLabel('查看修改', { exact: true })).toHaveValue(produced.changeSet.id);
+  passed('existing tasks show one goal-level Continue with shared control dimensions and no retired phase navigation');
+  await newTask.click();
+  await expect(page.getByTestId('fwa-workflow-intake')).toBeVisible();
+  await expect(page.getByLabel('需求描述', { exact: true })).toHaveAttribute('rows', '2');
+  await measure('requirement'); await shot('02-requirement'); checkControls('requirement');
+  const prompt = report.measurements.requirement.find(item => item.tag === 'textarea');
+  assert.equal(prompt.fontSize, '14px'); assert.equal(prompt.lineHeight, '20px'); assert.equal(prompt.height, 58);
+  await expect(page.getByLabel('规划模式', { exact: true })).toHaveCount(0);
+  passed('expanded requirement controls retain the configured 2-row prompt and shared 36px / 14px dimensions');
+  await newTask.click();
+  await page.getByTestId('fwa-dag').locator('[data-node-id="counter-increment"]').click();
+  const diff = page.getByTestId('fwa-candidate-diff');
+  await expect(diff).toBeVisible();
+  await diff.locator(':scope > summary').click();
   await expect(page.locator('.fwa-diff')).toBeVisible({ timeout: 20000 });
-  await expect(page.getByRole('button', { name: '验证这项修改', exact: true })).toBeEnabled();
-  await measure('changes'); await shot('02-changes'); checkControls('changes');
-  passed('candidate details render a real diff and validation control at the same dimensions');
-  assert.equal(git(['rev-parse', 'HEAD']), baseline); assert.deepEqual(report.errors, []); report.ok = true;
+  await expect(page.getByRole('button', { name: '验证这项修改', exact: true })).toHaveCount(0);
+  await measure('changes'); await shot('03-changes'); checkControls('changes');
+  passed('node candidate details render a real disclosed diff with the same control dimensions');
+  assert.equal(git(['rev-parse', 'HEAD']), baseline);
+  const status = await app.getStatus();
+  assert.equal(status.runs.length, 1); assert.equal(status.evaluations.length, 0); assert.equal(status.integrations.length, 0);
+  assert.deepEqual(report.errors, []); report.ok = true;
 } catch (error) {
   report.ok = false; report.failure = { message: error.message, stack: error.stack }; process.exitCode = 1;
   if (page) { await shot('failure').catch(() => {}); await writeFile(path.join(output, 'failure-dom.txt'), await page.locator('body').ariaSnapshot().catch(() => 'Snapshot unavailable')); }

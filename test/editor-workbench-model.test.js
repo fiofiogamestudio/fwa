@@ -22,11 +22,69 @@ function deepFreeze(value) {
   return value;
 }
 
+test('automatic continuation resumes a validated candidate while manual contracts still await confirmation', () => {
+  const data = state([node('candidate', { status: 'accepted', changeSetIds: ['change'],
+    acceptedChangeSetId: 'change', acceptance: { checks: ['feature-check'] } })], {
+    changeSets: [{ id: 'change', nodeId: 'candidate', valid: true, kind: 'execution', changedFiles: ['feature.js'] }]
+  });
+  const session = { allowWrite: true, workflow: { work: true }, review: { configured: true, completionMode: 'automatic',
+    manualProfiles: [], validationProfiles: [{ id: 'feature', checks: [{ id: 'feature-check' }] }] } };
+  assert.equal(model.workAvailability(data, session, 'goal').allowed, true);
+  session.review.manualProfiles = ['feature'];
+  assert.equal(model.workAvailability(data, session, 'goal').allowed, false);
+  assert.equal(model.workAvailability(data, session, 'goal').reason, '已有结果待确认并收束。');
+  session.review.manualProfiles = []; session.review.completionMode = 'manual';
+  assert.equal(model.workAvailability(data, session, 'goal').allowed, false);
+  session.review.completionMode = 'automatic'; data.changeSets[0].valid = false;
+  assert.equal(model.workAvailability(data, session, 'goal').allowed, false);
+});
+
+test('overview keeps recovery visible in read-only mode and never calls uncertain occupancy running', () => {
+  const data = state([node('lost', { status: 'running' })], {
+    operational: { workspaceLease: { held: true, ownerAlive: false } }
+  });
+  const overview = model.buildOverview(data, { allowWrite: false }, 'goal');
+  assert.match(overview.nextText, /中断.*恢复/);
+  assert.equal(overview.actionKind, 'focus');
+  data.nodes[0].status = 'planned';
+  data.operational.workspaceLease.ownerAlive = null;
+  assert.equal(model.buildOverview(data, { allowWrite: false }, 'goal').nextText, '工作区占用状态待核查。');
+});
+
+test('overview prioritizes admitted independent work and only offers viewing for unverified or empty candidates', () => {
+  const session = { allowWrite: true, workflow: { work: true } };
+  const data = state([node('failed', { status: 'failed' }), node('ready', { status: 'ready' })]);
+  const overview = model.buildOverview(data, session, 'goal');
+  assert.equal(overview.actionKind, 'work');
+  assert.match(overview.nextText, /1 项可推进/);
+  data.nodes = [node('candidate', { status: 'produced', changeSetIds: ['change'] })];
+  data.changeSets = [{ id: 'change', nodeId: 'candidate', changedFiles: [] }];
+  const empty = model.buildOverview(data, session, 'goal');
+  assert.equal(empty.actionKind, 'focus');
+  assert.match(empty.nextText, /未产生文件改动/);
+  assert.doesNotMatch(empty.nextText, /确认.*完成/);
+  assert.match(model.nodeWorkbench(data, 'candidate').resultSummary, /未产生文件改动/);
+});
+
+test('overview avoids duplicate completion counts, cross-goal execution and false completion', () => {
+  const data = state([node('done', { status: 'accepted', integrationStatus: 'integrated',
+    acceptedChangeSetId: 'change', integratedChangeSetId: 'change', integratedTargetRef: 'main' })]);
+  const done = model.buildOverview(data, { allowWrite: false }, 'goal');
+  assert.equal(done.progressText, '已完成 1 / 1');
+  assert.equal(done.nextText, '全部结果已确认并集成。');
+  assert.equal(done.actionKind, '');
+  data.nodes[0].integratedChangeSetId = 'other';
+  assert.equal(model.buildOverview(data, { allowWrite: false }, 'goal').progressText, '已完成 0 / 1');
+  const all = model.buildOverview(data, { allowWrite: true, workflow: { work: true } }, null);
+  assert.equal(all.actionKind, '');
+  assert.match(all.nextText, /选择一个任务/);
+});
+
 test('UMD supports a browser global, CommonJS-like vm and globalThis without dependencies', () => {
   for (const context of [{ window: {} }, { module: { exports: {} } }, {}]) {
     assert.equal(typeof load(context).buildDag, 'function');
   }
-  assert.deepEqual(Object.keys(model).sort(), ['buildDag', 'buildRefs', 'nodeDetails', 'statusLabel', 'tone'].sort());
+  assert.deepEqual(Object.keys(model).sort(), ['buildDag', 'buildRefs', 'buildProgress', 'buildOverview', 'nodeDetails', 'nodeWorkbench', 'workAvailability', 'statusLabel', 'tone'].sort());
 });
 
 test('unknown states are retained, missing state is not a fabricated metric or success', () => {
@@ -59,31 +117,25 @@ test('DAG preserves a split and multi-predecessor merge with prerequisite-to-dep
     [['left', 'merge'], ['right', 'merge'], ['root', 'left'], ['root', 'right']]);
 });
 
-test('hierarchical DAG keeps containment separate from dependencies and hides superseded leaves', () => {
+test('the executable DAG contains only real outcome nodes and dependency edges, even with nested groups', () => {
   const input = state([node('old', { supersededByRevision: 2 }), node('source'), node('current', { dependsOn: ['source'] })], {
-    workflow: { goals: [{ id: 'goal', children: [{ id: 'bundle', type: 'group', title: '分组', phase: 'ready', flags: {},
-      children: [{ id: 'source', type: 'node' }, { id: 'current', type: 'node' }] }] }] }
+    workflow: { goals: [{ id: 'goal', children: [{ id: 'bundle', type: 'group', title: 'Feature', flags: { blocked: true }, children: [
+      { id: 'nested', type: 'group', children: [{ id: 'source', type: 'node' }, { id: 'current', type: 'node' }] }
+    ] }] }] }
   });
   const graph = model.buildDag(input, 'goal');
-  assert.deepEqual(plain(graph.nodes.map(item => item.id)), ['bundle', 'current', 'source']);
-  assert.deepEqual(plain(graph.edges.filter(item => item.kind === 'containment').map(item => [item.source, item.target, item.label])),
-    [['bundle', 'current', '包含'], ['bundle', 'source', '包含']]);
-  assert.deepEqual(plain(graph.edges.filter(item => item.kind === 'dependency').map(item => [item.source, item.target, item.label])),
-    [['source', 'current', '前置依赖']]);
+  assert.deepEqual(plain(graph.nodes.map(item => item.id)), ['current', 'source']);
+  assert.equal(graph.edges.length, 1); assert.equal(graph.edges[0].kind, 'dependency');
+  assert.equal(graph.nodes.some(item => item.objectType === 'groups'), false);
+  assert.equal(graph.edges.some(item => item.kind === 'containment'), false);
 });
 
-test('all-goals DAG namespaces equal group IDs without mixing containment or navigation identity', () => {
+test('all-goals DAG has no group placeholder nodes or containment arrows', () => {
   const input = state([node('a'), node('b', { goalId: 'other' })], { workflow: { goals: ['goal', 'other'].map((id, index) => ({
-    id, children: [{ type: 'group', id: 'shared', title: id, phase: 'plan', children: [{ type: 'node', id: index ? 'b' : 'a' }] }]
+    id, children: [{ type: 'group', id: 'shared', title: id, children: [{ type: 'node', id: index ? 'b' : 'a' }] }]
   })) } });
-  const graph = model.buildDag(input);
-  const groups = graph.nodes.filter(item => item.objectType === 'groups');
-  assert.equal(groups.length, 2);
-  assert.equal(new Set(graph.nodes.map(item => item.id)).size, graph.nodes.length);
-  for (const group of groups) {
-    assert.equal(group.objectId, 'shared');
-    assert.ok(graph.edges.some(edge => edge.source === group.id && edge.target === (group.goalId === 'goal' ? 'a' : 'b')));
-  }
+  assert.deepEqual(plain(model.buildDag(input).nodes.map(item => item.id)), ['a', 'b']);
+  assert.equal(model.buildDag(input).edges.length, 0);
 });
 
 test('goal filtering, duplicate declarations and missing prerequisites cannot create dangling edges', () => {
@@ -97,7 +149,7 @@ test('goal filtering, duplicate declarations and missing prerequisites cannot cr
   assert.ok(details.blockers.some(value => value.includes('absent') && value.includes('未记录')));
 });
 
-test('DAG exposes three independent state dimensions and never promotes planned or produced status', () => {
+test('DAG shows one understandable current state while details preserve independent technical facts', () => {
   const input = state([node('rejected', { status: 'rejected' }),
     node('pending', { dependsOn: ['rejected'] }), node('candidate', { status: 'produced' }),
     node('accepted', { status: 'accepted' }),
@@ -105,11 +157,11 @@ test('DAG exposes three independent state dimensions and never promotes planned 
     node('complete', { status: 'accepted', validity: 'valid', integrationStatus: 'integrated' })]);
   const graph = model.buildDag(input);
   const cards = new Map(graph.nodes.map(item => [item.id, item]));
-  assert.equal(cards.get('candidate').tone, 'warning');
+  assert.equal(cards.get('candidate').tone, 'neutral');
   assert.equal(cards.get('accepted').tone, 'neutral');
   assert.equal(cards.get('stale').tone, 'warning');
-  assert.equal(cards.get('complete').tone, 'success');
-  assert.deepEqual(plain(cards.get('stale').badges), ['状态：已验收', '有效性：已过期', '集成：已集成']);
+  assert.equal(cards.get('complete').tone, 'neutral');
+  assert.deepEqual(plain(cards.get('stale').badges), ['受阻']);
   const pending = model.nodeDetails(input, 'pending');
   assert.equal(pending.node.status, 'planned');
   assert.ok(pending.blockers.some(value => value.includes('已拒绝')));
@@ -205,4 +257,45 @@ test('projections never mutate frozen input and details do not hand out mutable 
   const details = model.nodeDetails(input, 'work');
   details.node.title = 'local edit'; details.refs[0].version = 'local version';
   assert.equal(JSON.stringify(input), before);
+});
+
+
+test('node workbench exposes outcome, authored completion checks and per-edge reasons without fabricating old reasons', () => {
+  const input = state([node('source'), node('target', { outcome: 'A usable report', instruction: 'Implement report export', dependsOn: ['source'],
+    dependencyReasons: [{ nodeId: 'source', reason: 'Needs the normalized input schema' }], derivedFrom: 'original', acceptance: { checks: ['Export opens', { id: 'lint', description: 'Lint passes' }] } })]);
+  const detail = model.nodeWorkbench(input, 'target');
+  assert.equal(detail.outcome, 'A usable report'); assert.equal(detail.dependencies[0].reason, 'Needs the normalized input schema');
+  assert.deepEqual(plain(detail.completion), [{ text: 'Export opens' }, { text: 'Lint passes' }]);
+  assert.match(detail.derivedText, /original/); assert.match(detail.resultSummary, /尚无/);
+  delete input.nodes[1].dependencyReasons;
+  assert.equal(model.nodeWorkbench(input, 'target').dependencies[0].reason, '依赖原因未记录');
+  assert.equal(model.buildDag(input).edges[0].reason, '依赖原因未记录');
+});
+
+test('work admission blocks duplicate jobs, lease/fence, pending feedback and hard budgets but permits explicit repaired input checks', () => {
+  const session = { allowWrite: true, workflow: { work: true }, review: { configured: true } };
+  const input = state([node('ready', { status: 'ready' })]);
+  const check = (jobs = []) => model.workAvailability(input, session, 'goal', 'ready', jobs);
+  assert.equal(check().allowed, true);
+  assert.equal(check([{ state: 'running' }]).allowed, false);
+  input.operational = { workspaceLease: { held: true, ownerAlive: false } }; assert.match(check().reason, /恢复/);
+  input.operational = { gitProcessFence: { held: true } }; assert.equal(check().allowed, false);
+  delete input.operational;
+  input.workflow = { feedback: [{ goalId: 'goal', status: 'pending' }] }; assert.match(check().reason, /补充要求/);
+  input.workflow.feedback = [];
+  input.retryDiagnostics = [{ nodeId: 'ready', blocked: true, code: 'logical-node-retry-budget-exhausted' }]; assert.equal(check().allowed, false);
+  for (const code of ['retry-input-repair-required', 'retry-no-progress']) {
+    input.retryDiagnostics[0].code = code; assert.equal(check().allowed, true); assert.equal(check().repairRequired, true);
+  }
+  session.allowWrite = false; assert.match(check().reason, /只读/);
+  session.allowWrite = true; session.review.configured = false; assert.match(check().reason, /检查配置/);
+});
+
+test('continuing an existing candidate requires current valid nonempty output and never enables accepted delivery for new work', () => {
+  const session = { allowWrite: true, workflow: { work: true }, review: { configured: true } };
+  const input = state([node('candidate', { status: 'produced', changeSetIds: ['c'] })], { changeSets: [{ id: 'c', nodeId: 'candidate', valid: true, kind: 'execution', changedFiles: ['report.md'] }] });
+  const check = () => model.workAvailability(input, session, 'goal', 'candidate');
+  assert.equal(check().allowed, true);
+  input.changeSets[0].changedFiles = []; assert.equal(check().allowed, false);
+  input.changeSets[0].changedFiles = ['report.md']; input.nodes[0].status = 'accepted'; assert.equal(check().allowed, false);
 });

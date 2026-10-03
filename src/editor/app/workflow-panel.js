@@ -83,8 +83,9 @@
     if (typeof root.FwaSurface?.create !== 'function') throw new Error('FWA configured surface host is required.');
     const interactionLimits = root.FwaSurface.interactionLimits?.();
     if (!interactionLimits) throw new Error('FWA interaction admission contract is required.');
-    const state = { data: { libraries: [], jobs: [], capabilities: {} }, selected: new Set(), request: '', mode: 'plan',
+    const state = { data: { libraries: [], jobs: [], capabilities: {} }, selected: new Set(), request: '',
       activeLibrary: null, version: null, path: '', busy: new Set(), drafts: new Map(), feedbackMessages: new Map(),
+      feedbackOpen: new Map(), submittedIntake: null, planningError: null, planningErrorVersion: 0,
       opened: new Set(), disclosures: {}, disposed: false, treeTicket: 0, previewTicket: 0, message: '', error: false };
     let intake, detailHost, libraryList, jobsHost, planButton, permissionHost;
     const feedbackHosts = new Map();
@@ -97,7 +98,6 @@
         element.value = ''; void importSelection({ files, directories: [] });
       },
       requestChanged({ value }) { state.request = value || ''; syncDisabled(); },
-      modeChanged({ value }) { state.mode = value; syncDisabled(); },
       librarySelected({ value, data }) { if (value) state.selected.add(data.id); else state.selected.delete(data.id); syncDisabled(); },
       browseLibrary({ data }) { state.activeLibrary = data.id; state.version = data.currentVersionId; state.path = ''; intake.refs.references.open = true; void showLibrary(); },
       versionChanged({ value }) { state.version = value; state.path = ''; void showLibrary(); },
@@ -107,8 +107,10 @@
       plan() {
         if (planButton.disabled) return;
         void action('plan', async () => {
-          const result = await command('workflow.plan', { request: state.request.trim(), libraryIds: [...state.selected], mode: state.mode });
-          state.disclosures.recent = true; if (intake?.refs.recent) intake.refs.recent.open = true;
+          state.planningError = null;
+          const submitted = intakeSignature();
+          const result = await command('workflow.plan', { request: state.request.trim(), libraryIds: [...state.selected], mode: 'plan' });
+          state.submittedIntake = submitted;
           message(surface.text('planned', { job: result?.id ? ` · ${short(result.id)}` : '' })); await refreshHost?.();
         });
       },
@@ -120,18 +122,25 @@
           message(surface.text('permissionSaved')); await refreshHost?.(); await showLibrary();
         });
       },
-      feedbackChanged({ value, data }) { state.drafts.set(data.nodeId, value || ''); },
+      feedbackChanged({ value, data }) { state.drafts.set(data.nodeId, value || ''); feedbackHosts.get(data.nodeId)?.update(); },
       submitFeedback({ data, refs }) {
         const item = feedbackHosts.get(data.nodeId); item?.update();
         if (refs.submit.disabled || !refs.feedback.value.trim()) return;
         void action(`feedback:${data.nodeId}`, async () => {
           await command('node.feedback', { nodeId: data.nodeId, text: refs.feedback.value.trim() });
+          state.drafts.delete(data.nodeId); refs.feedback.value = '';
           state.feedbackMessages.set(data.nodeId, surface.text('feedbackSaved')); await refreshHost?.(); item?.update();
         });
       },
       revise({ data, refs }) {
         const item = feedbackHosts.get(data.nodeId); item?.update(); if (refs.revise.disabled) return;
         void action(`revise:${data.nodeId}`, async () => {
+          const text = refs.feedback.value.trim();
+          if (text) {
+            await command('node.feedback', { nodeId: data.nodeId, text });
+            state.drafts.delete(data.nodeId); refs.feedback.value = '';
+            await refreshHost?.();
+          }
           const status = getStatus(), node = status.nodes.find(value => value.id === data.nodeId);
           const revision = status.workflow?.revisions?.filter(value => value.goalId === node?.goalId).at(-1);
           const feedbackIds = (status.workflow?.feedback || []).filter(value => value.goalId === node?.goalId && value.status === 'pending').map(value => value.id);
@@ -160,9 +169,19 @@
       state.message = text; state.error = error;
       if (intake?.isConnected) surface.update({ message: text, error }, intake);
     }
+    function intakeSignature() { return JSON.stringify([state.request.trim(), [...state.selected].sort()]); }
+    function intakeState() {
+      const job = [...(state.data.jobs || [])].reverse().find(item => item.type === 'workflow.plan');
+      const requiresInput = job && (['failed', 'interrupted'].includes(job.state) || job.result?.questions?.length > 0);
+      const attentionKey = state.planningError || (requiresInput
+        ? JSON.stringify([job.id, job.state, job.error || null, job.result?.questions || []]) : null);
+      const signature = intakeSignature();
+      return { hasDraft: Boolean(state.request.trim() || state.selected.size) && signature !== state.submittedIntake,
+        attentionKey, needsAttention: attentionKey !== null };
+    }
     function syncDisabled() {
-      if (intake?.isConnected) surface.update({ planLabel: state.mode === 'work' ? '生成计划并开始执行' : '生成修改计划', uploadDisabled: !writable() || state.busy.has('import'),
-        hasJobs: !!state.data.jobs?.length, needsReviewSetup: getSession?.()?.review?.configured === false,
+      if (intake?.isConnected) surface.update({ planLabel: '生成任务图', uploadDisabled: !writable() || state.busy.has('import'),
+        hasJobs: !!state.data.jobs?.length, needsReviewSetup: writable() && getSession?.()?.review?.configured === false,
         planningBlocker: state.data.capabilities?.plan === false ? '尚未配置需求规划器，不能生成计划。' : '',
         planDisabled: !writable() || state.busy.has('plan') || state.data.capabilities?.plan === false
           || (!state.request.trim() && !state.selected.size) || state.selected.size > interactionLimits.maxReferenceLibraries }, intake);
@@ -175,6 +194,7 @@
       try { await operation(); }
       catch (error) {
         message(errorText(error), true);
+        if (key === 'plan') state.planningError = `request-failed:${++state.planningErrorVersion}`;
         if (key.startsWith('feedback:') || key.startsWith('revise:')) state.feedbackMessages.set(key.slice(key.indexOf(':') + 1), surface.text('requestFailed', { error: errorText(error) }));
       }
       finally { state.busy.delete(key); syncDisabled(); for (const item of feedbackHosts.values()) item.update(); }
@@ -210,12 +230,16 @@
           const change = changes.find(item => item.id === member.changeSetId && item.runId === member.runId);
           return Array.isArray(change?.changedFiles) && change.changedFiles.length === 0;
         });
-        const kind = ({ 'workflow.plan': '需求规划', 'workflow.work': '执行任务', 'workflow.revise': '修订计划', 'change.validate': '验证修改', 'change.accept': '人工验收', 'change.integrate': '采用修改', 'change.revert': '撤销修改', 'experiment.run': '效果对照' })[job.type] || job.type;
+        const kind = ({ 'workflow.plan': '生成任务图', 'workflow.work': '继续任务', 'workflow.finish': '确认并继续', 'workflow.revise': '调整任务图', 'change.finish': '完成确认', 'change.auto-finish': '自动收束', 'change.policy-accept': '按规则确认', 'change.validate': '验证修改', 'change.accept': '人工验收', 'change.integrate': '采用修改', 'change.revert': '撤销修改', 'experiment.run': '效果对照' })[job.type] || '操作';
         const stateLabel = question ? surface.text('jobQuestions') : job.state === 'succeeded' && job.result?.phase === 'plan' ? '计划已生成'
           : job.state === 'queued' ? '排队中' : labels[job.state] ? surface.text(labels[job.state]) : job.state;
         const stopLabel = ({ 'awaiting-feedback-revision': '等待修订计划', 'no-ready-leaves': '没有可执行任务，请检查依赖或待验收修改',
-          'execution-failed': '执行失败', 'no-changes-awaiting-review': '没有文件修改，需检查结果', 'awaiting-acceptance': '等待验收',
-          'needs-acceptance': '等待验收', 'selected-leaf-processed': '所选任务已处理', 'round-limit': '已到本次执行轮数上限' })[stopReason] || stopReason;
+          'execution-failed': '执行失败', 'no-changes-awaiting-review': '没有文件修改，需检查结果', 'awaiting-acceptance': '验证通过，等待确认并收束',
+          'needs-review-config': '未配置项目检查，执行受阻', 'needs-validation-profile': '缺少验证配置，执行受阻',
+          'retry-no-progress': '重复修复没有进展，已停止', 'logical-node-retry-budget-exhausted': '此任务的尝试次数已用尽',
+          'repair-needs-attention': '自动修复受阻，请查看失败原因', 'awaiting-independent-review': '等待独立评审',
+          'validation-failed': '验证未通过，请查看节点结果', 'goal-completed': '当前目标已完成',
+          'needs-acceptance': '等待确认并收束', 'selected-leaf-processed': '所选任务已处理', 'round-limit': '本轮已暂停，请检查当前节点状态后继续' })[stopReason] || stopReason;
         return { id: job.id, heading: `${kind} · ${stateLabel}`,
           shortId: short(job.id), errorText: job.error ? `${job.error.code || ''} ${job.error.message || job.error}` : '',
           questions: (job.result?.questions || []).map(value => typeof value === 'string' ? value : JSON.stringify(value)),
@@ -292,10 +316,10 @@
       if (state.disposed) return;
       detailHost = detail;
       const previous = intake;
-      if (previous) for (const key of ['references', 'settings', 'recent']) state.disclosures[key] = previous.refs[key]?.open || false;
-      intake = render('intake', { request: state.request, mode: state.mode, message: state.message, error: state.error,
-        referencesOpen: state.disclosures.references, settingsOpen: state.disclosures.settings, recentOpen: state.disclosures.recent,
-        planLabel: state.mode === 'work' ? '生成计划并开始执行' : '生成修改计划',
+      if (previous) for (const key of ['references', 'recent']) state.disclosures[key] = previous.refs[key]?.open || false;
+      intake = render('intake', { request: state.request, message: state.message, error: state.error,
+        referencesOpen: state.disclosures.references, recentOpen: state.disclosures.recent,
+        planLabel: '生成任务图',
         maxFileMiB: mib(importLimits().maxFileBytes), maxUploadMiB: mib(importLimits().maxUploadBytes),
         maxReferenceLibraries: interactionLimits.maxReferenceLibraries, uploadDisabled: true, planDisabled: true });
       if (previous && previous !== intake) releaseOwned(previous);
@@ -312,8 +336,10 @@
     function nodeFeedback(host, nodeId) {
       if (state.disposed) return;
       const previous = feedbackHosts.get(nodeId); if (previous?.host === host && previous.root.isConnected) { previous.update(); return; }
-      if (previous) releaseOwned(previous.root);
+      if (previous) { state.feedbackOpen.set(nodeId, previous.root.open); releaseOwned(previous.root); }
       const section = render('feedback', { nodeId, draft: state.drafts.get(nodeId) || '' }); host.append(section);
+      section.open = state.feedbackOpen.get(nodeId) === true;
+      listen(section, 'toggle', () => { state.feedbackOpen.set(nodeId, section.open); });
       const list = section.refs.feedbackList;
       function update() {
         if (!section.isConnected) return;
@@ -322,9 +348,13 @@
         const active = hasActiveOperation(status);
         const current = node?.supersededByRevision == null && (status.goals || []).some(goal => goal.id === node?.goalId && goal.nodeIds?.includes(nodeId));
         const revision = status.workflow?.revisions?.filter(item => item.goalId === node?.goalId).at(-1);
-        surface.update({ submitDisabled: !writable() || !current || state.busy.has(`feedback:${nodeId}`),
-          reviseDisabled: !writable() || !current || !revision || active || !pending.length || pending.length > interactionLimits.maxRevisionFeedback || state.busy.has(`revise:${nodeId}`),
-          result: [state.feedbackMessages.get(nodeId), surface.text(!current ? 'historicalNode' : active ? 'activeOperation' : 'feedbackBoundary')].filter(Boolean).join(' ') }, section);
+        const busy = state.busy.has(`feedback:${nodeId}`) || state.busy.has(`revise:${nodeId}`);
+        const ownPending = pending.some(item => item.nodeId === nodeId || item.logicalId === (node?.logicalId || nodeId));
+        surface.update({ submitVisible: active, submitDisabled: !writable() || !current || busy,
+          summary: `调整此任务${state.drafts.get(nodeId)?.trim() ? ' · 未提交草稿' : ownPending ? ' · 有待处理要求' : ''}`,
+          reviseDisabled: !writable() || !current || !revision || active || (!pending.length && !state.drafts.get(nodeId)?.trim())
+            || pending.length + (state.drafts.get(nodeId)?.trim() ? 1 : 0) > interactionLimits.maxRevisionFeedback || busy,
+          result: [state.feedbackMessages.get(nodeId), !current ? surface.text('historicalNode') : active ? surface.text('activeOperation') : ''].filter(Boolean).join(' ') }, section);
         replace(list, render('feedbackList', { items: feedback.filter(item => item.nodeId === nodeId || (item.goalId === node?.goalId && item.logicalId === (node?.logicalId || nodeId)))
           .map(item => ({ text: item.text, statusLabel: item.status === 'pending' ? surface.text('feedbackPending')
             : surface.text('feedbackState', { status: item.status, revision: item.appliedRevisionId || surface.text('seeRevision') }) })) }));
@@ -339,21 +369,29 @@
       const found = matches.length === 1 ? matches[0] : null;
       if (!found) { host.append(render('groupMissing')); return; }
       const pending = [...(found.children || [])], leaves = [];
-      while (pending.length) { const item = pending.shift(); if (item.type === 'node') leaves.push({ id: item.id, label: `${item.title} · ${item.phase}` }); else pending.push(...(item.children || [])); }
-      host.append(render('group', { title: found.title || found.id, phase: found.phase, leaves, record: JSON.stringify(found, null, 2) }));
+      while (pending.length) { const item = pending.shift(); if (item.type === 'node') leaves.push({ id: item.id, label: `${item.title} · ${item.activity?.label ?? item.phase}` }); else pending.push(...(item.children || [])); }
+      host.append(render('group', { title: found.title || found.id, phase: found.activity?.label ?? found.phase, leaves, record: JSON.stringify(found, null, 2) }));
     }
     function refresh(data) {
       if (state.disposed) return;
       const before = JSON.stringify(state.data.libraries || []), jobsBefore = JSON.stringify(state.data.jobs || []);
+      const previousAttention = intakeState().attentionKey;
       state.data = data || { libraries: [], jobs: [], capabilities: {} };
       const ids = new Set((state.data.libraries || []).map(item => item.id));
       for (const id of state.selected) if (!ids.has(id)) state.selected.delete(id);
       if (before !== JSON.stringify(state.data.libraries || [])) { renderLibraries(); if (intake?.isConnected && detailHost?.isConnected) void showLibrary(); }
       if (jobsBefore !== JSON.stringify(state.data.jobs || [])) renderJobs();
-      for (const [id, item] of feedbackHosts) { if (item.root.isConnected) item.update(); else { releaseOwned(item.root); feedbackHosts.delete(id); } }
+      const attention = intakeState().attentionKey;
+      if (attention && attention !== previousAttention) {
+        state.disclosures.recent = true;
+        if (intake?.refs.recent) intake.refs.recent.open = true;
+      }
+      for (const [id, item] of feedbackHosts) { if (item.root.isConnected) item.update(); else {
+        state.feedbackOpen.set(id, item.root.open); releaseOwned(item.root); feedbackHosts.delete(id);
+      } }
       syncDisabled();
     }
-    return { renderIntake, refresh, nodeFeedback, renderGroup, dispose() {
+    return { renderIntake, refresh, nodeFeedback, renderGroup, intakeState, dispose() {
       state.disposed = true; state.treeTicket++; state.previewTicket++; feedbackHosts.clear();
       for (const { element, name, callback, options } of nativeListeners) element.removeEventListener(name, callback, options);
       nativeListeners.clear(); fragments.clear(); surface.dispose();

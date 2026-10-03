@@ -35,17 +35,6 @@
     "eventSequence": "#{sequence}"
   },
   "fields": {
-    "reviewNote": {
-      "schemaPath": "commands.reviewNote",
-      "type": "textarea",
-      "label": "验收结论",
-      "rows": 3
-    },
-    "reviewProfile": {
-      "type": "select",
-      "label": "项目验证配置",
-      "options": []
-    },
     "revertNote": {
       "schemaPath": "commands.reviewNote",
       "type": "textarea",
@@ -66,6 +55,21 @@
         },
         {
           "type": "text",
+          "text": "确认后将完成当前结果，并自动推进后续任务。",
+          "visible": {
+            "$path": "showFinish"
+          }
+        },
+        {
+          "type": "text",
+          "text": "检查通过后将自动完成；需要恢复执行时，使用工作台顶部“继续”。",
+          "visible": {
+            "$path": "autoContinue"
+          },
+          "tone": "muted"
+        },
+        {
+          "type": "text",
           "text": {
             "$path": "failureText"
           },
@@ -82,22 +86,6 @@
           "template": "text"
         },
         {
-          "type": "field",
-          "field": "reviewNote",
-          "attrs": {
-            "name": "acceptanceNote"
-          },
-          "value": {
-            "$path": "draft.acceptanceNote"
-          },
-          "on": {
-            "input": "reviewDraft"
-          },
-          "visible": {
-            "$path": "showAccept"
-          }
-        },
-        {
           "type": "text",
           "text": {
             "$path": "acceptedText"
@@ -111,54 +99,20 @@
           "children": [
             {
               "type": "button",
-              "text": "验证这项修改",
+              "text": "确认并继续",
+              "tone": "primary",
               "attrs": {
                 "disabled": {
-                  "$path": "validateDisabled"
+                  "$path": "finishDisabled"
                 },
-                "data-action": "validate"
+                "data-action": "finish"
               },
               "on": {
                 "click": "reviewAction"
               },
               "visible": {
-                "$path": "showValidate"
-              },
-              "tone": "primary"
-            },
-            {
-              "type": "button",
-              "text": "记录人工验收",
-              "attrs": {
-                "disabled": {
-                  "$path": "acceptDisabled"
-                },
-                "data-action": "accept"
-              },
-              "on": {
-                "click": "reviewAction"
-              },
-              "visible": {
-                "$path": "showAccept"
-              },
-              "tone": "primary"
-            },
-            {
-              "type": "button",
-              "text": "回归通过后采用",
-              "attrs": {
-                "disabled": {
-                  "$path": "integrateDisabled"
-                },
-                "data-action": "integrate"
-              },
-              "on": {
-                "click": "reviewAction"
-              },
-              "visible": {
-                "$path": "showIntegrate"
-              },
-              "tone": "primary"
+                "$path": "showFinish"
+              }
             }
           ]
         },
@@ -234,20 +188,12 @@
           "children": [
             {
               "type": "summary",
-              "text": "验证设置"
+              "text": "检查配置与规则"
             },
             {
-              "type": "field",
-              "field": "reviewProfile",
-              "ref": "profile",
-              "attrs": {
-                "name": "profileId"
-              },
-              "value": {
-                "$path": "draft.profileId"
-              },
-              "on": {
-                "change": "reviewDraft"
+              "type": "text",
+              "text": {
+                "$path": "profileText"
               }
             },
             {
@@ -258,17 +204,8 @@
               }
             },
             {
-              "type": "details",
-              "children": [
-                {
-                  "type": "summary",
-                  "text": "验收规则"
-                },
-                {
-                  "type": "text",
-                  "text": "检查通过后仍需人工验收。采用和撤销都会再次运行回归检查。"
-                }
-              ]
+              "type": "text",
+              "text": "项目检查自动匹配任务的验收条件，集成前运行回归检查。"
             }
           ]
         },
@@ -590,117 +527,206 @@
     },
     "node": {
       "type": "stack",
+      "testId": "fwa-node-detail",
       "children": [
-        {
-          "type": "text",
-          "text": {
-            "$text": "nodeKicker"
-          },
-          "tone": "muted"
-        },
         {
           "type": "heading",
           "text": {
-            "$path": "title"
+            "$path": "headline"
           }
         },
         {
-          "type": "list",
-          "items": {
-            "$path": "statuses"
-          },
-          "template": "status"
-        },
-        {
-          "type": "list",
-          "items": {
-            "$path": "blockers"
-          },
-          "template": "blocker"
-        },
-        {
-          "type": "template",
-          "template": "metadata",
-          "data": {
-            "rows": [
-              {
-                "label": "目标",
-                "value": {
-                  "$path": "goalTitle",
-                  "default": "未记录"
-                }
+          "type": "row",
+          "children": [
+            {
+              "type": "badge",
+              "text": {
+                "$path": "activity.label"
               },
-              {
-                "label": "尝试次数",
-                "value": {
-                  "$path": "runCount",
-                  "default": "未记录"
-                }
-              },
-              {
-                "label": "最大重试",
-                "value": {
-                  "$path": "budget.maxRetries",
-                  "default": "未记录"
-                }
-              },
-              {
-                "label": "文件上限",
-                "value": {
-                  "$path": "budget.maxFiles",
-                  "default": "未记录"
-                }
-              },
-              {
-                "label": "Diff 行数上限",
-                "value": {
-                  "$path": "budget.maxDiffLines",
-                  "default": "未记录"
-                }
-              },
-              {
-                "label": "所需能力",
-                "value": {
-                  "$path": "capabilitiesText",
-                  "default": "未记录"
-                }
+              "tone": {
+                "$path": "activity.tone"
               }
-            ]
-          }
+            }
+          ]
         },
         {
-          "type": "stack",
-          "ref": "dependencies"
-        },
-        {
-          "type": "stack",
-          "ref": "references"
-        },
-        {
-          "type": "stack",
-          "ref": "runs"
-        },
-        {
-          "type": "stack",
-          "ref": "changes"
-        },
-        {
-          "type": "stack",
-          "ref": "evidence"
-        },
-        {
-          "type": "button",
-          "text": "填写重试申请",
-          "visible": {
-            "$path": "canRetry"
+          "type": "text",
+          "text": {
+            "$path": "activity.reason"
           },
-          "on": {
-            "click": "retry"
+          "visible": {
+            "$path": "activity.reason"
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "executionBlocker"
+          },
+          "tone": "warning",
+          "visible": {
+            "$path": "executionBlocker"
+          }
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "nextAction"
+          },
+          "tone": "muted",
+          "visible": {
+            "$path": "nextAction"
           }
         },
         {
           "type": "stack",
-          "ref": "records"
+          "visible": {
+            "$path": "hasResult"
+          },
+          "children": [
+            {
+              "type": "text",
+              "text": {
+                "$path": "resultSummary"
+              }
+            },
+            {
+              "type": "slot",
+              "ref": "resultDiff"
+            },
+            {
+              "type": "slot",
+              "ref": "review"
+            }
+          ]
+        },
+        {
+          "type": "stack",
+          "visible": {
+            "$path": "hasDependencies"
+          },
+          "children": [
+            {
+              "type": "heading",
+              "text": {
+                "$path": "dependencyTitle"
+              }
+            },
+            {
+              "type": "slot",
+              "ref": "dependencies"
+            }
+          ]
+        },
+        {
+          "type": "details",
+          "testId": "fwa-node-acceptance",
+          "children": [
+            {
+              "type": "summary",
+              "text": {
+                "$path": "acceptanceTitle"
+              }
+            },
+            {
+              "type": "list",
+              "items": {
+                "$path": "completion"
+              },
+              "template": "completion"
+            }
+          ]
+        },
+        {
+          "type": "details",
+          "attrs": {
+            "data-fwa-node-technical": true
+          },
+          "children": [
+            {
+              "type": "summary",
+              "text": "执行记录与技术细节"
+            },
+            {
+              "type": "text",
+              "text": {
+                "$path": "title"
+              },
+              "tone": "muted"
+            },
+            {
+              "type": "text",
+              "text": {
+                "$path": "derivedText"
+              },
+              "visible": {
+                "$path": "derivedText"
+              },
+              "tone": "muted"
+            },
+            {
+              "type": "details",
+              "children": [
+                {
+                  "type": "summary",
+                  "text": "完整执行要求"
+                },
+                {
+                  "type": "text",
+                  "text": {
+                    "$path": "instruction",
+                    "default": "未记录"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": {
+                "$path": "activity.attemptsText"
+              }
+            },
+            {
+              "type": "text",
+              "text": {
+                "$path": "activity.lastProgressText"
+              }
+            },
+            {
+              "type": "text",
+              "text": {
+                "$path": "id"
+              },
+              "tone": "muted"
+            },
+            {
+              "type": "list",
+              "items": {
+                "$path": "blockers"
+              },
+              "template": "blocker"
+            },
+            {
+              "type": "slot",
+              "ref": "references"
+            },
+            {
+              "type": "slot",
+              "ref": "runs"
+            },
+            {
+              "type": "slot",
+              "ref": "changes"
+            },
+            {
+              "type": "slot",
+              "ref": "evidence"
+            },
+            {
+              "type": "slot",
+              "ref": "records"
+            }
+          ]
         }
       ]
     },
@@ -990,15 +1016,6 @@
       "children": [
         {
           "type": "text",
-          "text": {
-            "$path": "instruction"
-          },
-          "visible": {
-            "$path": "instruction"
-          }
-        },
-        {
-          "type": "text",
           "text": "此变更集没有文件变化，不能据此判断需求已经完成。",
           "tone": "warning",
           "visible": {
@@ -1039,6 +1056,24 @@
             {
               "type": "summary",
               "text": "版本与技术记录"
+            },
+            {
+              "type": "details",
+              "children": [
+                {
+                  "type": "summary",
+                  "text": "完整执行要求"
+                },
+                {
+                  "type": "text",
+                  "text": {
+                    "$path": "instruction"
+                  },
+                  "visible": {
+                    "$path": "instruction"
+                  }
+                }
+              ]
             },
             {
               "type": "template",
@@ -1380,6 +1415,57 @@
           ]
         }
       ]
+    },
+    "completion": {
+      "type": "text",
+      "text": {
+        "$path": "text"
+      }
+    },
+    "dependency": {
+      "type": "row",
+      "children": [
+        {
+          "type": "slot",
+          "ref": "link"
+        },
+        {
+          "type": "text",
+          "text": {
+            "$path": "reason"
+          },
+          "tone": "muted",
+          "visible": {
+            "$path": "reason"
+          }
+        }
+      ]
+    },
+    "candidateDiff": {
+      "type": "details",
+      "testId": "fwa-candidate-diff",
+      "children": [
+        {
+          "type": "summary",
+          "text": "查看文件差异"
+        },
+        {
+          "type": "list",
+          "items": {
+            "$path": "files"
+          },
+          "template": "changedFile"
+        },
+        {
+          "type": "slot",
+          "ref": "body"
+        }
+      ],
+      "attrs": {
+        "data-fwa-candidate-id": {
+          "$path": "candidateId"
+        }
+      }
     }
   }
 }

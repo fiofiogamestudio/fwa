@@ -89,14 +89,14 @@ class Element {
 const descendants = node => [node, ...node.children.flatMap(descendants)];
 const find = (node, predicate) => { const matches = descendants(node).filter(predicate); assert.equal(matches.length, 1); return matches[0]; };
 const text = node => node.hidden ? '' : [node.textContent, ...node.children.map(text)].join(' ');
-function ui({ allowWrite = true, readApi, interactionLimits, review } = {}) {
+function ui({ allowWrite = true, readApi, interactionLimits, review, onCommand } = {}) {
   const { create } = load({ ui: true, interactionLimits }), commands = [];
   const status = { goals: [{ id: 'g', nodeIds: ['n'] }], nodes: [{ id: 'n', goalId: 'g', title: 'Node', status: 'ready' }],
     runs: [], evaluations: [], integrations: [], reversions: [], runBatches: [],
     workflow: { feedback: [], revisions: [{ goalId: 'g', revision: 1 }], goals: [] } };
   const main = new Element('main'), detail = new Element('aside'); main.attached = true; detail.attached = true;
   const api = readApi || (async () => ({ versionId: 'v1', tree: { name: 'Library', path: '', type: 'directory', access: 'read', children: [] } }));
-  const panel = create({ api, command: async (type, payload) => { commands.push({ type, payload }); return { id: 'job-one' }; },
+  const panel = create({ api, command: async (type, payload) => { commands.push({ type, payload }); await onCommand?.(type, payload, status); return { id: 'job-one' }; },
     C: { el: (tag, value, className) => new Element(tag, value, className), record: value => new Element('pre', JSON.stringify(value)) },
     getStatus: () => status, getSession: () => ({ allowWrite, review }), refresh: async () => {} });
   return { panel, main, detail, commands, status };
@@ -119,19 +119,19 @@ test('intake keeps drafts and current-library selection across polling and remou
   find(main, node => node.tagName === 'FORM').emit('submit'); await flush();
   assert.equal(commands.length, 1); assert.equal(commands[0].type, 'workflow.plan'); assert.equal(commands[0].payload.request, 'Unsubmitted request');
   assert.deepEqual(Array.from(commands[0].payload.libraryIds), ['lib']); assert.equal(commands[0].payload.mode, 'plan');
-  assert.equal(find(main, node => node.dataset.testid === 'fwa-workflow-jobs').parentElement.open, true, 'submitted request feedback becomes visible');
+  assert.equal(find(main, node => node.dataset.testid === 'fwa-workflow-jobs').parentElement.open, false, 'ordinary submission keeps recent requests folded');
   assert.match(text(main), /已提交/); assert.doesNotMatch(text(main), /工程已完成！/);
   panel.dispose();
 });
 
-test('the optional Work setting remains explicit and changes only the requested execution mode', async () => {
+test('requirement submission always produces a graph before execution', async () => {
   const { panel, main, detail, commands } = ui();
   panel.refresh({ libraries: [], jobs: [], capabilities: { plan: true } }); panel.renderIntake(main, detail);
   const request = find(main, node => node.attributes['aria-label'] === '需求描述'); request.value = 'One independent change'; request.emit('input');
-  const mode = find(main, node => node.attributes['aria-label'] === '规划模式'); mode.value = 'work'; mode.emit('change');
-  assert.equal(find(main, node => node.textContent === '生成计划并开始执行').disabled, false);
+  assert.equal(descendants(main).some(node => node.attributes['aria-label'] === '规划模式'), false);
+  assert.equal(find(main, node => node.textContent === '生成任务图').disabled, false);
   find(main, node => node.tagName === 'FORM').emit('submit'); await flush();
-  assert.equal(commands[0].payload.mode, 'work'); assert.equal(commands[0].payload.request, request.value);
+  assert.equal(commands[0].payload.mode, 'plan'); assert.equal(commands[0].payload.request, request.value);
   panel.dispose();
 });
 
@@ -139,7 +139,7 @@ test('missing planner and project checks remain explicit after removing idle hel
   const { panel, main, detail } = ui({ review: { configured: false } });
   panel.refresh({ libraries: [], jobs: [], capabilities: { plan: false } }); panel.renderIntake(main, detail);
   assert.match(text(main), /尚未配置需求规划器/); assert.match(text(main), /未配置项目检查/);
-  assert.equal(find(main, node => node.textContent === '生成修改计划').disabled, true);
+  assert.equal(find(main, node => node.textContent === '生成任务图').disabled, true);
   panel.refresh({ libraries: [], jobs: [], capabilities: { plan: true } });
   assert.doesNotMatch(text(main), /尚未配置需求规划器/); assert.match(text(main), /未配置项目检查/);
   assert.equal(find(main, node => node.dataset.testid === 'fwa-workflow-jobs').parentElement.hidden, true);
@@ -152,15 +152,15 @@ test('feedback is pending, draft survives remount, and active work blocks revisi
   status.workflow.feedback.push({ id: 'f', nodeId: 'n', goalId: 'g', text: 'Pending change', status: 'pending' });
   panel.nodeFeedback(detail, 'n');
   const input = find(detail, node => node.attributes['aria-label'] === '节点修改建议'); input.value = 'Make a new version'; input.emit('input');
-  assert.equal(find(detail, node => node.tagName === 'BUTTON' && node.textContent === '按待处理反馈修订计划').disabled, true);
-  assert.equal(find(detail, node => node.tagName === 'BUTTON' && node.textContent === '提交待处理反馈').disabled, false);
+  assert.equal(find(detail, node => node.tagName === 'BUTTON' && node.textContent === '按补充要求调整图').disabled, true);
+  assert.equal(find(detail, node => node.tagName === 'BUTTON' && node.textContent === '暂存补充要求').disabled, false);
   assert.match(text(detail), /待处理 · 尚未生效/);
-  find(detail, node => node.tagName === 'BUTTON' && node.textContent === '提交待处理反馈').emit('click'); await flush();
+  find(detail, node => node.tagName === 'BUTTON' && node.textContent === '暂存补充要求').emit('click'); await flush();
   assert.equal(commands[0].type, 'node.feedback'); assert.equal(commands[0].payload.text, 'Make a new version');
   detail.replaceChildren(); panel.nodeFeedback(detail, 'n');
-  assert.equal(find(detail, node => node.attributes['aria-label'] === '节点修改建议').value, 'Make a new version');
+  assert.equal(find(detail, node => node.attributes['aria-label'] === '节点修改建议').value, '', 'submitted feedback is not silently submitted twice');
   status.nodes[0].status = 'accepted'; status.runs[0].status = 'produced'; panel.refresh({ libraries: [], jobs: [], capabilities: {} });
-  const revise = find(detail, node => node.tagName === 'BUTTON' && node.textContent === '按待处理反馈修订计划'); assert.equal(revise.disabled, false);
+  const revise = find(detail, node => node.tagName === 'BUTTON' && node.textContent === '按补充要求调整图'); assert.equal(revise.disabled, false);
   revise.emit('click'); await flush();
   assert.equal(commands[1].type, 'workflow.revise'); assert.equal(commands[1].payload.expectedRevision, 1);
   assert.deepEqual(Array.from(commands[1].payload.feedbackIds), ['f']); panel.dispose();
@@ -173,9 +173,9 @@ test('readonly mode disables writes and true job failures/questions remain expli
     { id: 'l', type: 'workflow.work', state: 'succeeded', result: { stopReason: 'needs-acceptance' } }] });
   panel.renderIntake(main, detail); panel.nodeFeedback(detail, 'n');
   assert.ok(descendants(main).filter(node => node.type === 'file').every(node => node.disabled));
-  assert.equal(find(main, node => node.tagName === 'BUTTON' && node.textContent === '生成修改计划').disabled, true);
-  assert.match(text(main), /需要补充信息/); assert.match(text(main), /Real failure/); assert.match(text(main), /等待验收/);
-  assert.equal(find(detail, node => node.tagName === 'BUTTON' && node.textContent === '提交待处理反馈').disabled, true);
+  assert.equal(find(main, node => node.tagName === 'BUTTON' && node.textContent === '生成任务图').disabled, true);
+  assert.match(text(main), /需要补充信息/); assert.match(text(main), /Real failure/); assert.match(text(main), /等待确认并收束/);
+  assert.equal(find(detail, node => node.tagName === 'BUTTON' && node.textContent === '暂存补充要求').disabled, true);
   assert.equal(commands.length, 0); panel.dispose();
 });
 
@@ -211,13 +211,34 @@ test('zero-change warnings use exact historical ChangeSets without rewriting imm
   panel.dispose();
 });
 
+test('repair stop reasons display distinct Chinese outcomes without rewriting recorded jobs', () => {
+  const { panel, main, detail } = ui();
+  const expected = {
+    'retry-no-progress': '重复修复没有进展，已停止',
+    'logical-node-retry-budget-exhausted': '此任务的尝试次数已用尽',
+    'repair-needs-attention': '自动修复受阻，请查看失败原因',
+    'awaiting-independent-review': '等待独立评审',
+    'awaiting-feedback-revision': '等待修订计划',
+    'awaiting-acceptance': '验证通过，等待确认并收束'
+  };
+  panel.renderIntake(main, detail);
+  for (const [stopReason, label] of Object.entries(expected)) {
+    const jobs = [{ id: stopReason, type: 'workflow.work', state: 'succeeded', result: { stopReason } }];
+    const before = JSON.stringify(jobs);
+    panel.refresh({ libraries: [], jobs });
+    assert.ok(text(main).includes(label), stopReason);
+    assert.equal(JSON.stringify(jobs), before);
+  }
+  panel.dispose();
+});
+
 test('revision UI fence matches project-wide scheduler operations and historical nodes cannot submit', async () => {
   const { hasActiveOperation } = load();
   const { panel, detail, commands, status } = ui();
   status.workflow.feedback.push({ id: 'f', nodeId: 'n', goalId: 'g', text: 'Pending', status: 'pending' });
   panel.nodeFeedback(detail, 'n');
-  const submit = find(detail, node => node.tagName === 'BUTTON' && node.textContent === '提交待处理反馈');
-  const revise = find(detail, node => node.tagName === 'BUTTON' && node.textContent === '按待处理反馈修订计划');
+  const submit = find(detail, node => node.tagName === 'BUTTON' && node.textContent === '暂存补充要求');
+  const revise = find(detail, node => node.tagName === 'BUTTON' && node.textContent === '按补充要求调整图');
   const cases = { runs: ['pending', 'running', 'paused', 'produced', 'failed'], evaluations: ['requested', 'running', 'recovery-required', 'passed'],
     integrations: ['pending', 'running', 'recovery-required', 'succeeded'], reversions: ['pending', 'running', 'recovery-required', 'succeeded'], runBatches: ['running', 'completed'] };
   for (const [collection, states] of Object.entries(cases)) for (const operationStatus of states) {
@@ -230,7 +251,7 @@ test('revision UI fence matches project-wide scheduler operations and historical
   status.runs = [{ status: 'failed', failure: { code: 'git-process-termination-unconfirmed', details: { fencePersisted: false } } }];
   assert.equal(hasActiveOperation(status), hasActiveProjectOperation(status)); panel.refresh({ libraries: [], jobs: [] }); assert.equal(revise.disabled, true);
   status.runs = []; status.nodes[0].supersededByRevision = 'revision-2'; panel.refresh({ libraries: [], jobs: [] });
-  assert.equal(submit.disabled, true); assert.equal(revise.disabled, true); assert.match(text(detail), /历史或已移出/);
+  assert.equal(submit.disabled, true); assert.equal(revise.disabled, true); assert.match(text(detail), /历史任务/);
   const input = find(detail, node => node.attributes['aria-label'] === '节点修改建议'); input.value = 'Historical draft'; input.emit('input');
   submit.emit('click'); revise.emit('click'); await flush(); assert.equal(commands.length, 0);
   delete status.nodes[0].supersededByRevision; status.goals[0].nodeIds = []; panel.refresh({ libraries: [], jobs: [] }); assert.equal(submit.disabled, true);
@@ -271,8 +292,7 @@ test('configured workflow uses native fields and inherited permission maps to a 
   assert.equal(request.tagName, 'TEXTAREA'); assert.equal(request.maxLength, '16384'); assert.equal(request.required, false);
   const directory = find(main, node => node.attributes['aria-label'] === '选择文件夹');
   assert.equal(directory.webkitdirectory, true, 'The reflected native boolean property must not receive an empty string.');
-  const mode = find(main, node => node.attributes['aria-label'] === '规划模式');
-  assert.equal(mode.tagName, 'SELECT'); assert.deepEqual(mode.children.map(option => option.value), ['plan', 'work']);
+  assert.equal(descendants(main).some(node => node.attributes['aria-label'] === '规划模式'), false);
   find(main, node => node.dataset.libraryId === 'lib').emit('click'); await flush();
   const versions = find(detail, node => node.attributes['aria-label'] === '预览资料版本'); versions.value = 'v1'; versions.emit('change'); await flush();
   assert.match(reads.at(-1), /versionId=v1/);
@@ -325,12 +345,87 @@ test('planning and revision admission guards use the host-provided shared limits
   panel.refresh({ libraries, jobs: [] });
   panel.renderIntake(main, detail); assert.match(text(main), /最多 1 个/);
   const inputs = descendants(main).filter(node => node.type === 'checkbox');
-  const plan = find(main, node => node.textContent === '生成修改计划');
+  const plan = find(main, node => node.textContent === '生成任务图');
   inputs[0].checked = true; inputs[0].emit('change'); assert.equal(plan.disabled, false);
   inputs[1].checked = true; inputs[1].emit('change'); assert.equal(plan.disabled, true);
   status.workflow.feedback = [{ id: 'f1', nodeId: 'n', goalId: 'g', text: 'One', status: 'pending' }];
   panel.nodeFeedback(detail, 'n');
-  const revise = find(detail, node => node.textContent === '按待处理反馈修订计划'); assert.equal(revise.disabled, false);
+  const revise = find(detail, node => node.textContent === '按补充要求调整图'); assert.equal(revise.disabled, false);
   status.workflow.feedback.push({ id: 'f2', nodeId: 'n', goalId: 'g', text: 'Two', status: 'pending' });
   panel.refresh({ libraries, jobs: [] }); assert.equal(revise.disabled, true); panel.dispose();
+});
+
+
+test('one adjustment action records durable feedback before revising the observed graph version', async () => {
+  const { panel, detail, commands, status } = ui({ onCommand(type, payload, snapshot) {
+    if (type === 'node.feedback') snapshot.workflow.feedback.push({ id: 'new-feedback', nodeId: payload.nodeId, goalId: 'g', text: payload.text, status: 'pending' });
+  } });
+  panel.nodeFeedback(detail, 'n');
+  const input = find(detail, node => node.attributes['aria-label'] === '节点修改建议');
+  const revise = find(detail, node => node.textContent === '按补充要求调整图'); assert.equal(revise.disabled, true);
+  input.value = 'Split the report into independently verifiable outputs'; input.emit('input'); assert.equal(revise.disabled, false);
+  revise.emit('click'); await flush();
+  assert.deepEqual(commands.map(item => item.type), ['node.feedback', 'workflow.revise']);
+  assert.equal(commands[1].payload.expectedRevision, status.workflow.revisions[0].revision);
+  assert.deepEqual(Array.from(commands[1].payload.feedbackIds), ['new-feedback']);
+  assert.equal(input.value, '', 'recorded input must not be duplicated during a later explicit retry');
+  panel.dispose();
+});
+
+test('intake state distinguishes new task drafts from submitted content and exposes stable planning attention', async () => {
+  const { panel, main, detail, commands } = ui();
+  const data = { libraries: [], jobs: [], capabilities: { plan: true } };
+  panel.refresh(data); panel.renderIntake(main, detail);
+  assert.match(text(main), /新任务需求/);
+  assert.equal(panel.intakeState().hasDraft, false);
+  const input = find(main, node => node.attributes['aria-label'] === '需求描述');
+  input.value = 'A new task'; input.emit('input');
+  assert.equal(panel.intakeState().hasDraft, true);
+  find(main, node => node.tagName === 'FORM').emit('submit'); await flush();
+  assert.equal(commands[0].type, 'workflow.plan');
+  assert.equal(panel.intakeState().hasDraft, false);
+  assert.equal(input.value, 'A new task', 'submitted content remains available to correct a planning failure');
+  input.value += ' with another constraint'; input.emit('input');
+  assert.equal(panel.intakeState().hasDraft, true);
+  const questions = { id: 'question-job', type: 'workflow.plan', state: 'succeeded', result: { questions: ['Which input?'] } };
+  panel.refresh({ ...data, jobs: [questions] });
+  const attention = panel.intakeState();
+  assert.equal(attention.needsAttention, true); assert.ok(attention.attentionKey);
+  const recent = find(main, node => node.dataset.testid === 'fwa-workflow-jobs').parentElement;
+  assert.equal(recent.open, true, 'a new planning question becomes visible');
+  recent.open = false;
+  panel.refresh({ ...data, jobs: [structuredClone(questions)] });
+  assert.equal(panel.intakeState().attentionKey, attention.attentionKey);
+  assert.equal(recent.open, false, 'unchanged polling respects a user-collapsed disclosure');
+  panel.refresh({ ...data, jobs: [questions, { id: 'next', type: 'workflow.plan', state: 'running' }] });
+  assert.equal(panel.intakeState().needsAttention, false);
+  panel.refresh({ ...data, jobs: [questions, { id: 'next', type: 'workflow.plan', state: 'failed', error: { message: 'Unavailable' } }] });
+  assert.notEqual(panel.intakeState().attentionKey, attention.attentionKey);
+  assert.equal(recent.open, true); panel.dispose();
+});
+
+test('task adjustment is folded by default and preserves its draft and disclosure across polling and remount', () => {
+  const { panel, detail, status } = ui();
+  panel.nodeFeedback(detail, 'n');
+  let disclosure = find(detail, node => node.dataset.testid === 'fwa-node-feedback');
+  assert.equal(disclosure.tagName, 'DETAILS'); assert.equal(disclosure.open, false);
+  const submit = find(detail, node => node.textContent === '暂存补充要求');
+  assert.equal(submit.hidden, true, 'idle adjustment offers only the combined adjustment action');
+  disclosure.open = true; disclosure.emit('toggle');
+  const input = find(detail, node => node.attributes['aria-label'] === '节点修改建议');
+  input.value = 'Preserve this adjustment'; input.emit('input');
+  assert.match(text(detail), /调整此任务 · 未提交草稿/);
+  panel.refresh({ libraries: [], jobs: [] });
+  assert.equal(disclosure.open, true); assert.equal(input.value, 'Preserve this adjustment');
+  detail.replaceChildren(); panel.refresh({ libraries: [], jobs: [] }); panel.nodeFeedback(detail, 'n');
+  disclosure = find(detail, node => node.dataset.testid === 'fwa-node-feedback');
+  assert.equal(disclosure.open, true);
+  assert.equal(find(detail, node => node.attributes['aria-label'] === '节点修改建议').value, 'Preserve this adjustment');
+  disclosure.open = false; disclosure.emit('toggle');
+  detail.replaceChildren(); panel.nodeFeedback(detail, 'n');
+  assert.equal(find(detail, node => node.dataset.testid === 'fwa-node-feedback').open, false);
+  status.runs.push({ id: 'running', status: 'running' }); panel.refresh({ libraries: [], jobs: [] });
+  assert.equal(find(detail, node => node.textContent === '暂存补充要求').hidden, false);
+  assert.equal(find(detail, node => node.textContent === '按补充要求调整图').disabled, true);
+  panel.dispose();
 });

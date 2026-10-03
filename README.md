@@ -6,8 +6,14 @@ Nodes, Runs, ChangeSets, Evidence, integrations, and reversions.
 **Status:** the V0.1 Goal-to-revert engineering spine is implemented. The current
 workbench additionally implements reference-library import, real Codex planning,
 hierarchical plans, isolated parallel Run batches and explicit feedback revisions.
-Default Work stops after candidate production awaiting acceptance; this is not a
-complete autonomous game-delivery loop. See the current boundaries below.
+The workbench keeps requirements, a persistent DAG and selected-node results on
+one screen. With trusted review configuration, Work executes and validates
+ready results. A configured completion policy can adopt passing candidates
+automatically; results requiring human judgment wait for one explicit
+confirmation before adoption and dependent execution. See
+[the node workflow](docs/node-workbench.md) for its rules and boundaries.
+For retry limits, idle detection, failure-log handling and the progress screen,
+see [`Predictable execution and recovery`](docs/execution-recovery.md).
 A retained
 live composition run validates the frozen source recorded in
 [`docs/v0.1-validation.md`](docs/v0.1-validation.md).
@@ -142,15 +148,25 @@ separate from executable dependency edges. Only leaf Nodes can run.
 Work dispatches ready leaves through `runReadyBatch`, with declared read/write
 and exclusive-resource conflict checks, one coordinator lease and independent
 Git worktrees. The default controller selects up to four leaves per round.
-Without a trusted acceptance/integration adapter, a successful batch stops at
-`awaiting-acceptance`; it does not automatically reach downstream leaves or
-done. With an explicit trusted `--review-config`, ChangeSet details now provide
-candidate validation, a separate recorded human acceptance, regression-gated
-adoption, and gated single-change reversion with dependency impact. See
+With an explicit trusted `--review-config`, Work automatically validates each
+candidate and can continue an existing candidate without producing it again.
+Ordinary execution or validation failures now continue within the same Work
+request: the executor receives bounded failure excerpts, exact candidate
+references and the configured checks for immediate self-testing. Attempts retain
+their original budget; repeated unchanged failure, uncertain process cleanup,
+pending feedback and independent review stop the affected work explicitly.
+Automatic completion policies validate and adopt through the regression gate;
+manual profiles use `change.finish` to record the user's confirmation.
+Downstream leaves unlock only after actual integration.
+An editor without a validation configuration stops before dispatching work.
+Programmatic trusted acceptance adapters remain supported; their successful
+return must also be backed by actual integration. Gated single-change reversion
+retains its dependency-impact review. See
 [`docs/change-review.md`](docs/change-review.md) for setup and exact boundaries.
 
-A batch containing any zero-file ChangeSet stops earlier at
-`no-changes-awaiting-review`, before automatic acceptance or integration.
+A zero-file ChangeSet stays at `no-changes-awaiting-review` instead of being
+automatically accepted. Configured machine validation can still check independent
+nonempty peers; trusted automatic-adoption callbacks pause the entire mixed batch.
 Inspect the exact Run output: a no-op may be legitimate or may reflect blocked
 tools. Neither process exit code zero nor an empty candidate proves completion.
 Older job records stay immutable; the UI adds warnings using their bound
@@ -163,10 +179,10 @@ logical IDs, prior Runs, commits and Evidence remain traceable; unrelated
 branches retain their current results. Revisions do not automatically restart
 Work or silently consume feedback received during an active Run.
 
-The workbench also provides a hierarchy/dependency graph, a separate
-declared-Ref relationship graph, per-Node attempt history, ChangeSet file/patch
-inspection, Evidence criteria and log viewers, immutable image/video artifact
-viewers, and a paginated persisted-event timeline. Selecting
+The workbench provides one persistent task DAG, per-Node attempt history, ChangeSet file/patch
+inspection, Evidence criteria and log viewers, and immutable image/video artifact
+viewers. Paginated persisted events remain available through the CLI/API; the
+single-page workbench no longer exposes the older event or manual-command sections. Selecting
 a graph node or record opens its linked facts in the inspector. The same
 independent FWE checkout supplies the reusable pan/zoom/selection graph
 component; FWA supplies the domain projection, not a second graph engine.
@@ -215,8 +231,10 @@ an uncertain command. Job return/success is not Node acceptance. Review commands
 use trusted startup profiles and preserve the existing evaluation, integration
 and reversion gates. Recovery remains an explicit CLI/API operation; the console
 never clears a lease or Git safety fence on the operator's behalf.
-Ordinary workspace Ref registration/update, pause/resume, approval and the
-complete autonomous acceptance loop remain outside the current page.
+Ordinary workspace Ref registration/update, pause/resume and general approval
+management remain outside the current page. Automatic completion is limited to
+the trusted review policy and configured checks; it does not replace human
+judgment for manual profiles or establish autonomous game-delivery quality.
 
 The adapter requires FWE `0.2.0` **with guarded server integration contract v1**.
 Older `0.2.0` checkouts without that capability are rejected; the visual
@@ -244,6 +262,10 @@ For embedding, import `src/editor/server.js` and call
 contains `url`, identity/fingerprint fields, `server`, `closed` and `close()`.
 The optional trusted `workflow` object may inject `planner`, `executor`,
 `codexOptions` and `acceptAndIntegrate`; browser requests cannot supply them.
+Built-in workbench adapters default to a three-minute total deadline per planning
+call and thirty minutes per execution. Output does not extend these deadlines.
+An explicit `workflow.codexOptions.timeoutMs` overrides both; `null` or `0`
+disables them. Injected adapters retain their own timeout policy.
 The API permits port `0` for isolated tests, while the CLI requires `1..65535`.
 The optional `open` flag defaults to `false`; the Windows launcher enables it
 to open the actual bound URL through FWE's existing browser helper.
@@ -318,6 +340,7 @@ fwa plan load <goal-id> <plan.json>
 fwa run next <input.json> --executor file-operations|codex
 fwa node retry <node-id> [--reason <text>]
 fwa run reconcile
+fwa run archive <run-id>
 fwa evaluate run <changeset-id> <profile.json>
 fwa evaluate reconcile
 fwa integrate apply <changeset-id> --target <branch>
@@ -381,8 +404,18 @@ node .\bin\fwa.js run next .\codex-input.json --executor codex `
 ```
 
 Codex runs non-interactively with `shell:false`, a fixed worktree, JSONL
-output, bounded capture, timeout/abort handling, attempted process-tree
+output, bounded capture, cancellation handling, attempted process-tree
 termination, and confirmation that the managed child has closed.
+The standalone executor has no total execution timeout by default. In trusted constructor
+options, `timeoutMs: null` (the default) or `timeoutMs: 0` disables that timer;
+an integer from `1` through `2147483647` opts into a millisecond timeout. Values
+outside Node's timer range are rejected instead of overflowing into an immediate
+timeout. `AbortSignal` cancellation and termination confirmation remain active.
+The Codex planner does not add `budget.wallTimeMinutes` to new plans. An existing
+plan's explicitly declared wall-time budget remains preserved and independently
+enforced by the Run orchestrator; remove it through an authored plan revision
+when the task must have no total time limit. Already running invocations retain
+the options and plan revision with which they started.
 It inherits user configuration by default. `ignoreUserConfig: true` is an
 explicit per-invocation bypass. The Windows-only
 `windowsSandboxOverride: "elevated"` is a separate privilege-expanding opt-in;

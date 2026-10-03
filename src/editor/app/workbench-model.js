@@ -48,38 +48,42 @@
     return node.status === 'accepted' && node.validity === 'valid' && node.integrationStatus === 'integrated'
       ? 'success' : 'neutral';
   }
-  function nodeCard(node, id = node.id) {
+  function nodeCard(node, id = node.id, currentActivity) {
     return {
-      id, title: title(node), subtitle: node.id, tone: nodeTone(node),
-      badges: [`状态：${statusLabel(node.status)}`, `有效性：${statusLabel(node.validity)}`,
+      id, title: title(node), subtitle: node.id, tone: currentActivity ? activityTone(currentActivity.state) : nodeTone(node),
+      badges: [...(currentActivity ? [`当前：${currentActivity.label}`] : []),
+        `${currentActivity ? '执行记录' : '状态'}：${statusLabel(node.status)}`, `有效性：${statusLabel(node.validity)}`,
         `集成：${statusLabel(node.integrationStatus)}`]
     };
+  }
+  function workflowActivities(status) {
+    const activities = new Map();
+    const visit = item => {
+      if (item.type === 'node' && item.activity) activities.set(item.id, item.activity);
+      for (const child of list(item.children)) visit(child);
+    };
+    for (const goal of list(status?.workflow?.goals)) visit(goal);
+    return activities;
   }
   function edge(kind, source, target, label) {
     return { id: `${kind}:${encodeURIComponent(source)}:${encodeURIComponent(target)}`, source, target, label, kind };
   }
   function buildDag(status, goalId) {
     const selected = selectedNodes(status, goalId);
+    const activities = new Map(buildProgress(status, goalId).groups.flatMap(group => group.items).map(item => [item.id, item]));
     const ids = new Set(selected.map(node => node.id));
     const edges = [];
     for (const node of selected) for (const prerequisite of list(node.dependsOn)) {
-      if (ids.has(prerequisite)) edges.push(edge('dependency', prerequisite, node.id, '前置依赖'));
+      if (ids.has(prerequisite)) edges.push({ ...edge('dependency', prerequisite, node.id, '前置依赖'),
+        reason: list(node.dependencyReasons).find(item => item.nodeId === prerequisite)?.reason || '依赖原因未记录' });
     }
-    const groups = [];
-    const visit = (item, parent, ownerGoalId) => {
-      if (item.type === 'group') {
-        const graphId = goalId == null ? `group:${encodeURIComponent(ownerGoalId)}/${encodeURIComponent(item.id)}` : item.id;
-        groups.push({ id: graphId, objectId: item.id, goalId: ownerGoalId, objectType: 'groups', title: item.title, subtitle: `分组 · ${item.phase}`, tone: item.phase === 'done' ? 'success' : item.phase === 'work' ? 'active' : 'neutral',
-          badges: Object.entries(item.flags || {}).filter(([, value]) => value === true).map(([key]) => key) });
-        if (parent) edges.push(edge('containment', parent, graphId, '包含'));
-        for (const child of list(item.children)) visit(child, graphId, ownerGoalId);
-      } else if (parent && ids.has(item.id)) edges.push(edge('containment', parent, item.id, '包含'));
-    };
-    for (const goal of list(status?.workflow?.goals).filter(goal => goalId == null || goal.id === goalId)) for (const item of list(goal.children)) visit(item, null, goal.id);
-    return { nodes: [...groups, ...selected.map(node => nodeCard(node))], edges: unique(edges).sort(compare) };
+    return { nodes: selected.map(node => ({ id: node.id, title: title(node),
+      subtitle: node.outcome || '', tone: activityTone(activities.get(node.id)?.state),
+      badges: [activities.get(node.id)?.label || '未开始'] })), edges: unique(edges).sort(compare) };
   }
   function buildRefs(status, goalId) {
     const selected = selectedNodes(status, goalId);
+    const activities = workflowActivities(status);
     const registered = unique(rows(status, 'refs'));
     const refsById = new Map(registered.map(ref => [ref.id, ref]));
     const touched = new Set();
@@ -96,7 +100,7 @@
       id: ref.id, title: ref.id, subtitle: typeof ref.uri === 'string' ? ref.uri : '未记录路径', tone: 'neutral',
       badges: [`类型：${ref.kind ?? '未记录'}`, `版本：${ref.version ?? '未记录'}`]
     }));
-    return { nodes: [...selected.map(node => nodeCard(node, `node:${node.id}`)), ...refs].sort(compare),
+    return { nodes: [...selected.map(node => nodeCard(node, `node:${node.id}`, activities.get(node.id))), ...refs].sort(compare),
       edges: unique(edges).sort(compare) };
   }
   function copy(value) {
@@ -167,5 +171,213 @@
     if (status?.operational?.workspaceLease?.held === true) blockers.push('项目工作区租约被占用；不能据缓存状态另行启动写操作。');
     return copy({ node, goal, blockers, runs, changeSets, evaluations, evidence, refs, integrations, reversions });
   }
-  return Object.freeze({ buildDag, buildRefs, nodeDetails, statusLabel, tone });
+  function activityTone(state) {
+    if (state === 'delivered') return 'success';
+    if (['running', 'evaluating', 'integrating'].includes(state)) return 'active';
+    if (state === 'failed') return 'danger';
+    if (['blocked', 'paused', 'awaiting-review', 'awaiting-feedback'].includes(state)) return 'warning';
+    return 'neutral';
+  }
+  function nodeWorkbench(status, nodeId) {
+    const detail = nodeDetails(status, nodeId);
+    if (!detail) return null;
+    const node = detail.node;
+    const activity = buildProgress(status, node.goalId).groups.flatMap(group => group.items).find(item => item.id === nodeId)
+      || { state: 'historical', label: '历史版本', reason: '此节点已被新的任务图版本替代。', tone: 'muted' };
+    const checks = typeof node.acceptance === 'string' ? [node.acceptance] : Array.isArray(node.acceptance) ? node.acceptance
+      : [...list(node.acceptance?.commands), ...list(node.acceptance?.checks)];
+    const completion = checks.map(item => ({ text: typeof item === 'string' ? item : item.description || item.title || item.id || JSON.stringify(item) }));
+    const dependencies = list(node.dependsOn).map(id => ({ id, title: rows(status, 'nodes').find(item => item.id === id)?.title || id,
+      reason: list(node.dependencyReasons).find(item => item.nodeId === id)?.reason || '依赖原因未记录' }));
+    const change = detail.changeSets.find(item => item.id === list(node.changeSetIds).at(-1));
+    return { ...detail, activity, outcome: node.outcome?.trim() || (title(node) + '（旧计划未单列结果说明）'),
+      completion: completion.length ? completion : [{ text: '完成条件未记录' }], dependencies, change,
+      derivedText: node.derivedFrom ? '派生自：' + node.derivedFrom : '',
+      resultSummary: activity.state === 'delivered' ? '结果已确认并集成。'
+        : Array.isArray(change?.changedFiles) && !change.changedFiles.length ? '未产生文件改动，需要核对执行记录。'
+        : change ? '已有候选结果 · ' + (change.changedFiles?.length || 0) + ' 个文件，确认并集成后才计为完成。'
+          : '尚无候选结果。' };
+  }
+  function workAvailability(status, session, goalId, nodeId, jobs = []) {
+    const denied = reason => ({ allowed: false, reason });
+    if (!session?.allowWrite) return denied('当前为只读模式。');
+    if (!goalId) return denied('请先选择一个目标。');
+    const goal = rows(status, 'goals').find(item => item.id === goalId);
+    if (!goal || !['planned', 'active'].includes(goal.status)) return denied('当前目标尚不可执行。');
+    if (!session.workflow?.work) return denied('当前未配置可用执行器。');
+    if (session.review?.configured === false) return denied('缺少项目检查配置，执行受阻。');
+    if (jobs.some(job => ['queued', 'running'].includes(job.state))) return denied('当前操作正在处理，请等待结果。');
+    if (status.operational?.gitProcessFence?.held) return denied('项目需要检查并恢复 Git 操作。');
+    if (status.operational?.workspaceLease?.held) return denied(status.operational.workspaceLease.ownerAlive === false ? '执行进程已退出，需要恢复工作区。' : '工作区正在被使用，请等待当前操作结束。');
+    if (rows(status, 'runBatches').some(item => item.status === 'running')
+      || rows(status, 'runs').some(item => ['pending', 'running', 'paused'].includes(item.status))
+      || ['evaluations', 'integrations', 'reversions'].some(key => rows(status, key).some(item => ['requested', 'pending', 'running', 'recovery-required'].includes(item.status)))) return denied('当前操作尚未结束或需要恢复。');
+    if (list(status.workflow?.feedback).some(item => item.goalId === goalId && item.status === 'pending')) return denied('先将补充要求纳入任务图，再继续执行。');
+    const items = buildProgress(status, goalId).groups.flatMap(group => group.items).filter(item => !nodeId || item.id === nodeId);
+    const repairable = new Set(rows(status, 'retryDiagnostics').filter(item => ['retry-input-repair-required', 'retry-no-progress'].includes(item.code)).map(item => item.nodeId));
+    let eligible = items.filter(item => {
+      const node = rows(status, 'nodes').find(node => node.id === item.id);
+      if (repairable.has(item.id) && node?.status === 'ready') return true;
+      if (item.state === 'ready') return true;
+      if (item.state !== 'awaiting-verification'
+        && !(session.review?.completionMode === 'automatic' && ['awaiting-review', 'awaiting-integration'].includes(item.state))) return false;
+      const change = rows(status, 'changeSets').find(change => change.id === list(node?.changeSetIds).at(-1));
+      return change?.valid === true && change.kind === 'execution' && change.changedFiles?.length > 0;
+    });
+    if (eligible.length && Array.isArray(session.review?.validationProfiles)) {
+      const profiles = session.review.validationProfiles;
+      eligible = eligible.filter(item => {
+        const node = rows(status, 'nodes').find(node => node.id === item.id);
+        const matches = profiles.filter(profile => {
+          if (typeof node.acceptance === 'string') return node.acceptance === profile.id;
+          const required = [...list(node.acceptance?.commands), ...list(node.acceptance?.checks)];
+          const available = list(profile.checks).map(check => check.id);
+          return required.length > 0 && required.length === available.length && required.every(id => available.includes(id))
+            && (!node.acceptance?.evaluators?.length || node.acceptance.evaluators.includes('command-evaluator'));
+        });
+        if (matches.length !== 1) return false;
+        item.manualConfirmation = list(session.review.manualProfiles).includes(matches[0].id);
+        return true;
+      });
+      if (!eligible.length) return denied('此节点缺少唯一且完整覆盖完成条件的验证配置，执行受阻。');
+      eligible = eligible.filter(item => !item.manualConfirmation || item.state === 'ready' || item.state === 'awaiting-verification');
+    }
+    if (!eligible.length) return denied(items.find(item => ['blocked', 'failed', 'paused'].includes(item.state))?.reason
+      || (items.some(item => ['awaiting-review', 'awaiting-integration'].includes(item.state)) ? '已有结果待确认并收束。' : '当前没有可推进的节点，请查看前置条件。'));
+    return { allowed: true, reason: '', repairRequired: eligible.some(item => repairable.has(item.id)), nodeIds: eligible.map(item => item.id) };
+  }
+  function buildProgress(status = {}, goalId) {
+    const workflow = new Map(), groupPaths = new Map();
+    const nodeOrder = new Map(rows(status, 'goals').flatMap(goal => list(goal.nodeIds)).map((id, index) => [id, index]));
+    const groupOrder = new Map();
+    const walk = (item, path, owner) => {
+      if (item.type === 'node') { workflow.set(item.id, item); return; }
+      const next = [...path, item.title || item.id];
+      groupPaths.set(`${owner}/${item.id}`, next.join(' / '));
+      groupOrder.set(`${owner}/${item.id}`, groupOrder.size);
+      for (const child of list(item.children)) walk(child, next, owner);
+    };
+    for (const goal of list(status.workflow?.goals)) for (const child of list(goal.children)) walk(child, [], goal.id);
+    const diagnostics = new Map(list(status.retryDiagnostics).map(item => [item.nodeId, item]));
+    const diagnosticCopy = {
+      'pending-node-feedback': ['有反馈尚未纳入计划。', '检查反馈并修订对应计划，保留已有候选。'],
+      'logical-node-retry-budget-exhausted': ['同一任务跨计划修订的尝试次数已用尽。', '先定位失败原因，再明确调整修复范围和预算。'],
+      'retry-input-repair-required': ['上次执行受到输入或输出限制阻塞。', '修复执行输入或适配器配置并检查后继续。'],
+      'retry-no-progress': ['重复失败产生了相同的改动和结果。', '根据失败证据修正输入、基线或执行器后继续。']
+    };
+    const byGoal = new Map(rows(status, 'goals').map(item => [item.id, item]));
+    for (const goal of byGoal.values()) for (const group of list(goal.groups)) {
+      const key = `${goal.id}/${group.id}`;
+      if (!groupOrder.has(key)) groupOrder.set(key, groupOrder.size);
+    }
+    const delivered = (node, goal) => node.status === 'accepted' && node.validity === 'valid'
+      && node.integrationStatus === 'integrated' && node.acceptedChangeSetId != null
+      && node.integratedChangeSetId === node.acceptedChangeSetId && goal?.integrationTargetRef != null
+      && node.integratedTargetRef === goal.integrationTargetRef;
+    const timeText = value => value && Number.isFinite(Date.parse(value))
+      ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '尚无已记录进展';
+    const fallback = (node, goal) => {
+      if (delivered(node, goal)) return { state: 'delivered', label: '已交付', reason: '当前结果已验收并集成。', nextAction: '查看交付证据。' };
+      const mapped = { running: ['running', '制作中'], evaluating: ['awaiting-verification', '待验证'],
+        failed: ['failed', '失败'], rejected: ['failed', '失败'], produced: ['awaiting-verification', '待验证'],
+        accepted: ['awaiting-integration', '待集成'], ready: ['ready', '待执行'], blocked: ['blocked', '受阻'], paused: ['paused', '已暂停'] };
+      const [state, label] = ['stale', 'invalid'].includes(node.validity) ? ['blocked', '受阻'] : mapped[node.status] ?? ['planned', '未开始'];
+      return { state, label, reason: nodeDetails(status, node.id)?.blockers[0] || '尚未记录完整交付。', nextAction: '查看任务详情。' };
+    };
+    const items = selectedNodes(status, goalId).sort((a, b) => (nodeOrder.get(a.id) ?? Infinity) - (nodeOrder.get(b.id) ?? Infinity)).map(node => {
+      const goal = byGoal.get(node.goalId), projected = workflow.get(node.id), diagnostic = diagnostics.get(node.id);
+      let current = projected?.activity ?? fallback(node, goal);
+      if (diagnostic?.blocked && !current.recoveryRequired && !['running', 'evaluating', 'integrating', 'queued', 'delivered',
+        'awaiting-review', 'awaiting-verification', 'awaiting-integration'].includes(current.state)) {
+        const waiting = /review|required-review/i.test(diagnostic.code || '') ? ['awaiting-review', '待评审']
+          : /feedback/i.test(diagnostic.code || '') ? ['awaiting-feedback', '待处理反馈'] : ['blocked', '受阻'];
+        const translated = diagnosticCopy[diagnostic.code];
+        current = { state: waiting[0], label: waiting[1], reason: translated?.[0] || diagnostic.message || current.reason,
+          nextAction: translated?.[1] || diagnostic.nextAction || current.nextAction };
+      }
+      const history = rows(status, 'nodes').filter(item => item.goalId === node.goalId && (item.logicalId ?? item.id) === (node.logicalId ?? node.id));
+      const historyIds = new Set(history.map(item => item.id));
+      const attempts = diagnostic?.attempts ?? projected?.attempts ?? new Set([...history.flatMap(item => list(item.runIds)),
+        ...rows(status, 'runs').filter(item => historyIds.has(item.nodeId)).map(item => item.id)]).size;
+      const lastProgressAt = diagnostic && Object.hasOwn(diagnostic, 'lastProgressAt') ? diagnostic.lastProgressAt : projected?.lastProgressAt ?? null;
+      return { id: node.id, title: title(node), goalId: node.goalId, parentId: node.parentId ?? null,
+        changeId: list(node.changeSetIds).at(-1), ...current, tone: activityTone(current.state), attempts, lastProgressAt,
+        attemptsText: `累计尝试 ${attempts} 次（含历史修订）${diagnostic?.repeatedFailureCount > 1 ? ` · 相同失败 ${diagnostic.repeatedFailureCount} 次` : ''}`,
+        lastProgressText: `最近有效进展：${timeText(lastProgressAt)}`,
+        identity: `${node.logicalId ?? node.id} · 定义版本 ${node.definitionRevision ?? 1}` };
+    });
+    const groups = new Map();
+    for (const item of items) {
+      const goal = byGoal.get(item.goalId), key = `${item.goalId}/${item.parentId ?? 'ungrouped'}`;
+      if (!groups.has(key)) {
+        const name = groupPaths.get(key) ?? list(goal?.groups).find(group => group.id === item.parentId)?.title ?? (item.parentId || '任务');
+        groups.set(key, { key, title: goalId == null ? `${goal?.title ?? item.goalId} / ${name}` : name, items: [] });
+      }
+      groups.get(key).items.push(item);
+    }
+    const counts = {};
+    for (const item of items) counts[item.state] = (counts[item.state] ?? 0) + 1;
+    const priority = ['running', 'evaluating', 'integrating', 'awaiting-review', 'failed', 'awaiting-feedback', 'paused',
+      'awaiting-verification', 'awaiting-integration', 'ready', 'queued', 'blocked', 'planned'];
+    const current = priority.flatMap(state => items.filter(item => item.state === state))[0];
+    const describeCounts = entries => {
+      const labels = new Map(entries.map(item => [item.state, item.label]));
+      return [...labels].map(([state, label]) => `${label} ${entries.filter(item => item.state === state).length}`).join(' · ');
+    };
+    const lastProgressAt = items.map(item => item.lastProgressAt).filter(value => value && Number.isFinite(Date.parse(value)))
+      .sort((a, b) => Date.parse(b) - Date.parse(a))[0] ?? null;
+    const planDiagnostics = list(status.planDiagnostics).filter(item => goalId == null || item.goalId === goalId).map(item => ({
+      key: `plan:${item.goalId}`, title: byGoal.get(item.goalId)?.title ?? item.goalId,
+      summary: `最长依赖链 ${item.metrics?.longestDependencyChainLength ?? '未记录'} 项 · 检查引用 ${item.metrics?.checkReferenceCount ?? '未记录'} 次 / ${item.metrics?.uniqueCheckCount ?? '未记录'} 个检查`,
+      findings: list(item.findings).filter(finding => finding.severity !== 'info').map(finding => ({ message: ({
+        LONG_DEPENDENCY_CHAIN: '依赖链较长：检查是否每个前置都必须先完成集成，保留真实的数据依赖。',
+        DECLARED_EFFECT_CONFLICTS: '部分任务共享写入范围或独占资源；图中并列不代表可以同时执行。',
+        BROAD_WRITE_DECLARATIONS: '部分写入范围过宽或被多个任务共用；并行前需明确文件归属。',
+        INVALID_PLAN: '计划未通过结构检查，需先修复计划。'
+      })[finding.code] ?? finding.message })), details: JSON.stringify(item, null, 2)
+    }));
+    return { total: items.length, delivered: counts.delivered ?? 0, counts, planDiagnostics, hasPlanDiagnostics: planDiagnostics.length > 0,
+    groups: [...groups.values()].sort((a, b) => (groupOrder.get(a.key) ?? Infinity) - (groupOrder.get(b.key) ?? Infinity)).map(group => ({ ...group,
+      summary: `已集成 ${group.items.filter(item => item.state === 'delivered').length} / ${group.items.length} · ${describeCounts(group.items)}` })),
+    progressText: `已集成 ${counts.delivered ?? 0} / ${items.length} 项`, countsText: describeCounts(items),
+    attemptsText: `累计尝试 ${items.reduce((sum, item) => sum + item.attempts, 0)} 次（含历史修订）`,
+    current, actionText: current ? `${current.label}：${current.title}` : items.length ? '全部当前任务已交付' : '尚无可执行计划',
+    reason: current?.reason || '', nextAction: current?.nextAction || '',
+    lastProgressAt, lastProgressText: `最近有效进展：${timeText(lastProgressAt)}` };
+  }
+  function buildOverview(status = {}, session, goalId, jobs = []) {
+    const progress = buildProgress(status, goalId), items = progress.groups.flatMap(group => group.items);
+    const action = workAvailability(status, session, goalId, null, jobs);
+    const result = { progressText: `已完成 ${progress.delivered} / ${progress.total}`, nextText: '',
+      actionKind: '', actionLabel: '', focusId: null };
+    const focus = (item, text, label = '查看任务') => ({ ...result, nextText: text,
+      actionKind: item ? 'focus' : '', actionLabel: label, focusId: item?.id || null });
+    if (!progress.total) return { ...result, progressText: '', nextText: '输入需求，生成任务图后开始。' };
+    if (!goalId) return { ...result, nextText: '选择一个任务，查看进度并继续。' };
+    if (progress.delivered === progress.total) return { ...result, nextText: '全部结果已确认并集成。' };
+    const recovery = items.find(item => item.recoveryRequired);
+    const lease = status.operational?.workspaceLease;
+    if (status.operational?.gitProcessFence?.held || recovery || lease?.held && lease.ownerAlive === false) {
+      return focus(recovery || progress.current, '执行已中断，需要先检查并恢复。', '查看中断任务');
+    }
+    const active = items.find(item => ['running', 'evaluating', 'integrating'].includes(item.state));
+    if (active) return focus(active, `${({ running: '正在执行', evaluating: '正在验证', integrating: '正在收束' })[active.state]}：${active.title}`, '查看当前任务');
+    if (jobs.some(job => ['queued', 'running'].includes(job.state)) || lease?.held) {
+      return { ...result, nextText: lease?.held && lease.ownerAlive == null ? '工作区占用状态待核查。' : '正在处理当前请求。' };
+    }
+    if (action.allowed) return { ...result, actionKind: 'work', actionLabel: action.repairRequired ? '检查并继续' : '继续执行',
+      nextText: `${action.nodeIds.length} 项可推进${items.some(item => ['failed', 'blocked'].includes(item.state)) ? '，其余任务等待处理' : ''}。` };
+    const candidate = items.find(item => ['awaiting-review', 'awaiting-integration', 'awaiting-verification'].includes(item.state));
+    if (candidate) {
+      const change = rows(status, 'changeSets').find(change => change.id === candidate.changeId);
+      const empty = Array.isArray(change?.changedFiles) && change.changedFiles.length === 0;
+      return focus(candidate, empty ? '未产生文件改动，需要核对执行记录。'
+        : candidate.state === 'awaiting-verification' ? '已有结果，等待验证。' : '已有结果，需要查看检查状态后收束。', empty ? '查看执行记录' : '查看结果');
+    }
+    const queued = items.find(item => item.state === 'queued');
+    if (queued) return focus(queued, `等待启动：${queued.title}`);
+    if (!session?.allowWrite) return { ...result, nextText: '选择节点查看进度和结果。' };
+    return focus(progress.current, action.reason, '查看待处理任务');
+  }
+  return Object.freeze({ buildDag, buildRefs, buildProgress, buildOverview, nodeDetails, nodeWorkbench, workAvailability, statusLabel, tone });
 });

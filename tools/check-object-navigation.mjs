@@ -27,8 +27,7 @@ const { expect } = await import(pathToFileURL(path.join(path.dirname(args.get('-
 const temporaryParent = realpathSync.native(tmpdir()), prefix = 'fwa-navigation-fixture-';
 const root = realpathSync.native(await mkdtemp(path.join(temporaryParent, prefix)));
 const report = { ok: false, fixtureRoot: root, fixtureRemoved: false, checks: [], screenshots: [], errors: [],
-  boundary: 'Real installed Chrome/FWE/Git; no AI adapter, game execution, integration or submitted browser draft.' };
-const attr = (name, value) => `[${name}=${JSON.stringify(value)}]`;
+  boundary: 'Real installed Chromium browser/FWE/Git; no AI adapter, game execution, integration or submitted browser draft.' };
 const passed = name => { report.checks.push(name); console.log(`PASS ${name}`); };
 const git = command => {
   const result = spawnSync('git', command, { cwd: root, encoding: 'utf8', windowsHide: true, timeout: 20000 });
@@ -101,7 +100,7 @@ try {
     let configured;
     Object.defineProperty(window, 'createFweSurface', { configurable: true, get: () => configured, set(factory) {
       configured = function (config, bindings = {}) {
-        const name = config.templates?.['goal.create'] ? 'console' : config.id || 'other';
+        const name = config.templates?.inspector && config.templates?.emptySelection ? 'console' : config.id || 'other';
         record({ event: 'surface-create', name });
         if (name === 'console' && bindings.actions?.draft) {
           const originalDraft = bindings.actions.draft;
@@ -128,32 +127,34 @@ try {
     const url = new URL(request.url());
     if (url.pathname.startsWith('/api/domains/fwa-projection/files/')) report.resourceRequests.push({ method: request.method(), path: decodeURIComponent(url.pathname) });
   });
-  await expect(page.getByTestId('fwa-status')).toContainText('已连接');
+  await expect(page.getByTestId('fwa-refresh')).toBeEnabled();
   const goalSelect = page.getByLabel('当前目标', { exact: true }), graph = page.getByTestId('fwa-dag');
   await expect(goalSelect).toHaveValue('');
-  await expect(graph.locator('[data-node-id]')).toHaveCount(4);
-  const groupNodes = await graph.locator('[data-node-id]').evaluateAll(nodes => nodes.map(node => ({ id: node.dataset.nodeId, text: node.textContent })));
-  assert.equal(new Set(groupNodes.map(node => node.id)).size, 4);
+  await expect(graph.locator('[data-node-id]')).toHaveCount(2);
+  await expect(graph.locator('[data-node-id="alpha-reader"]')).toHaveCount(1);
+  await expect(graph.locator('[data-node-id="beta-reader"]')).toHaveCount(1);
+  await capture('01-all-goals-task-nodes');
   for (let index = 0; index < goals.length; index++) {
-    const name = index === 0 ? 'Alpha' : 'Beta', groupGraphId = `group:${encodeURIComponent(goals[index].id)}/shared-group`;
-    assert.ok(groupNodes.some(node => node.id === groupGraphId && node.text.includes(`${name} group`)));
-    await clickOne(graph.locator(attr('data-node-id', groupGraphId)));
+    const name = index === 0 ? 'Alpha' : 'Beta';
+    // Groups remain native resources; the current task graph intentionally
+    // displays executable nodes rather than retired group cards.
+    const href = await page.evaluate(goalId => window.FwaNavigation.href('groups', 'shared-group', { goalId }), goals[index].id);
+    await page.goto(href);
     await expect(page.getByTestId('fwa-inspector').getByRole('heading', { name: `${name} group`, exact: true })).toBeVisible();
     await expect(page.getByTestId('fwa-inspector')).toContainText(`${name} reader`);
     await expect(page.getByTestId('fwa-inspector')).not.toContainText(`${index === 0 ? 'Beta' : 'Alpha'} reader`);
     await nativeResource(page, objectResourceName('groups', 'shared-group', { goalId: goals[index].id }));
   }
-  await capture('01-all-goals-unique-groups');
-  passed('all-goals DAG namespaces identical group IDs and selects the correct goal-local details');
+  passed('all-goals task graph contains both readers; native group resources isolate identical IDs by goal');
 
-  await expect(goalSelect).toHaveCount(1); await goalSelect.selectOption(goals[1].id);
-  await expect(graph.locator('[data-node-id]')).toHaveCount(2);
-  await clickOne(graph.locator('[data-node-id="shared-group"]'));
+  await expect(goalSelect).toHaveValue(goals[1].id);
+  await expect(graph.locator('[data-node-id]')).toHaveCount(1);
   const groupName = objectResourceName('groups', 'shared-group', { goalId: goals[1].id });
   await nativeResource(page, groupName);
-  const popupReady = page.waitForEvent('popup');
-  await clickOne(page.getByTestId('fwa-inspector').getByRole('link', { name: '在新窗口打开此对象', exact: true }));
-  const popup = await popupReady;
+  await page.getByTestId('fwa-inspector').locator('summary').filter({ hasText: /^对象链接$/ }).click();
+  const selfLink = page.getByTestId('fwa-inspector').getByRole('link', { name: '单独打开此记录', exact: true });
+  await expect(selfLink).toBeVisible();
+  const [popup] = await Promise.all([page.waitForEvent('popup'), selfLink.click()]);
   await expect(popup.getByTestId('fwa-inspector').getByRole('heading', { name: 'Beta group', exact: true })).toBeVisible();
   await expect(popup.getByLabel('当前目标', { exact: true })).toHaveValue(goals[1].id);
   await nativeResource(popup, groupName);
@@ -167,8 +168,11 @@ try {
   passed('scoped group native resource opens in a new tab and reload restores the same goal and group');
 
   await goalSelect.selectOption(goals[0].id);
-  await clickOne(page.locator('[data-section="refs"]'));
-  await clickOne(page.getByTestId('fwa-content').locator(attr('data-object-id', refId)));
+  await clickOne(graph.locator('[data-node-id="alpha-reader"]'));
+  const technical = page.getByTestId('fwa-node-detail').locator('[data-fwa-node-technical]');
+  if (!await technical.evaluate(element => element.open)) await technical.locator(':scope > summary').click();
+  const referencePath = encodeURIComponent(objectResourceName('refs', refId));
+  await clickOne(technical.locator(`a.fwe-resource-link[href*=${JSON.stringify(referencePath)}]`));
   await expect(page.getByTestId('fwa-ref-preview')).toContainText('Shared design reference');
   await expect(page.getByTestId('fwa-inspector').getByRole('link', { name: 'Alpha reader', exact: true })).toHaveCount(1);
   await expect(page.getByTestId('fwa-inspector').getByRole('link', { name: 'Beta reader', exact: true })).toHaveCount(1);
@@ -187,44 +191,42 @@ try {
   let loadingRoute;
   const loadingObserved = new Promise(resolve => { loadingRoute = resolve; });
   const interceptLoading = route => loadingRoute(route);
-  await page.route('**/api/domains/fwa-projection/files/projection.json', interceptLoading);
-  await clickOne(page.locator('[data-section="commands"]'));
+  const requestDisclosure = page.getByTestId('fwa-console').locator('details').filter({ has: page.getByTestId('fwa-workflow-intake') });
+  if (!await requestDisclosure.evaluate(element => element.open)) await requestDisclosure.locator(':scope > summary').click();
+  const requestInput = page.getByLabel('需求描述', { exact: true });
+  await expect(requestInput).toBeVisible();
+  const betaTechnical = page.getByTestId('fwa-node-detail').locator('[data-fwa-node-technical]');
+  if (!await betaTechnical.evaluate(element => element.open)) await betaTechnical.locator(':scope > summary').click();
+  const betaRef = betaTechnical.locator(`a.fwe-resource-link[href*=${JSON.stringify(referencePath)}]`);
+  await page.route('**/api/domains/fwa-projection/files/**', interceptLoading);
+  await clickOne(betaRef);
   const heldNavigation = await bounded(loadingObserved, 'the native projection resource request');
   const draft = 'DO NOT SUBMIT · native navigation must retain this local draft';
-  const titleInput = page.getByLabel('目标名称', { exact: true }), requestInput = page.getByLabel('具体请求', { exact: true });
   const rootIdentity = await page.getByTestId('fwa-console').elementHandle();
   // A held real resource read proves the loading contract deterministically,
   // without sleeps or patched app state. Descendant fields must be disabled,
   // not merely editable-looking controls inside an inert FWE workspace.
   await expect(page.getByTestId('fwa-console')).toHaveAttribute('aria-busy', 'true');
-  await expect(titleInput).toBeDisabled(); await expect(requestInput).toBeDisabled();
+  await expect(requestInput).toBeDisabled();
   await capture('05-native-navigation-loading');
   await heldNavigation.continue();
-  await page.unroute('**/api/domains/fwa-projection/files/projection.json', interceptLoading);
+  await page.unroute('**/api/domains/fwa-projection/files/**', interceptLoading);
   passed('native resource loading exposes busy state and disables descendant command fields until the read completes');
-  report.titleBeforeFill = await titleInput.evaluate(element => ({ inert: element.closest('[inert]')?.outerHTML.slice(0, 180),
-    disabled: element.disabled, readOnly: element.readOnly, connected: element.isConnected, hasDocumentFocus: document.hasFocus(), time: performance.now() }));
-  await expect(titleInput).toHaveCount(1); await titleInput.fill(draft);
-  report.titleAfterFill = await titleInput.evaluate(element => ({ value: element.value, inert: element.closest('[inert]')?.outerHTML.slice(0, 180),
-    active: document.activeElement?.name, time: performance.now() }));
-  await expect(titleInput).toHaveValue(draft);
-  await expect(requestInput).toHaveCount(1); await requestInput.fill('A private local draft, never committed.');
-  await expect(requestInput).toHaveValue('A private local draft, never committed.');
-  report.draftBeforeLeaving = { title: await titleInput.inputValue(), request: await requestInput.inputValue(), rootConnected: await rootIdentity.evaluate(root => root.isConnected) };
-  await clickOne(page.locator('[data-section="nodes"]'));
-  await clickOne(graph.locator('[data-node-id="beta-reader"]'));
+  await expect(requestInput).toBeEnabled(); await requestInput.fill(draft);
+  await expect(requestInput).toHaveValue(draft);
+  report.draftBeforeLeaving = { request: await requestInput.inputValue(), rootConnected: await rootIdentity.evaluate(root => root.isConnected) };
+  await clickOne(page.getByTestId('fwa-inspector').getByRole('link', { name: 'Beta reader', exact: true }));
   await nativeResource(page, objectResourceName('nodes', 'beta-reader'));
-  await clickOne(page.locator('[data-section="commands"]'));
-  report.draftAfterReturning = { title: await titleInput.inputValue(), request: await requestInput.inputValue(), sameRootConnected: await rootIdentity.evaluate(root => root.isConnected) };
-  await expect(titleInput).toHaveValue(draft);
-  await expect(requestInput).toHaveValue('A private local draft, never committed.');
-  await nativeResource(page, 'projection.json');
+  await page.getByTestId('fwa-refresh').click(); await expect(page.getByTestId('fwa-refresh')).toBeEnabled();
+  report.draftAfterReturning = { request: await requestInput.inputValue(), sameRootConnected: await rootIdentity.evaluate(root => root.isConnected) };
+  await expect(requestInput).toHaveValue(draft);
+  assert.equal(report.draftAfterReturning.sameRootConnected, true);
   await capture('05-command-draft-retained');
-  passed('legacy command draft survives native file navigation and remains unsubmitted');
+  passed('current requirement draft survives native object navigation and refresh without remounting or submission');
 
   readOnlyEditor = await startEditor({ projectRoot: root, fwePath: args.get('--fwe'), port: 0, allowWrite: false, workflow: { planner: null, executor: null } });
   const readOnlyPage = await context.newPage(); await readOnlyPage.goto(readOnlyEditor.url);
-  await expect(readOnlyPage.getByTestId('fwa-mode')).toContainText('只读');
+  await expect(readOnlyPage.getByText('只读预览', { exact: true })).toBeVisible();
   const session = await (await fetch(readOnlyEditor.url + '/api/fwa/session')).json();
   const command = await fetch(readOnlyEditor.url + '/api/fwa/commands', { method: 'POST',
     headers: { Origin: readOnlyEditor.url, 'Content-Type': 'application/json', 'X-FWA-CSRF': session.csrfToken, 'X-FWA-Fingerprint': session.fingerprint },

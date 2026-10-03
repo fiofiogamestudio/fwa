@@ -30,7 +30,7 @@ test('ordinary surfaces are JSON configurations with authoritative schema refere
     }
     visit(config);
   }
-  assert.ok(fields >= 9);
+  assert.ok(fields >= 4, 'Requirement, feedback, permission and reversion fields retain authoritative schemas.');
   assert.equal(configs.console.templates.shell.type, 'fieldset', 'Native navigation lock must also disable descendant form controls.');
 });
 
@@ -55,4 +55,16 @@ test('the adapter binds the actual model, native links and current FWE theme wit
   assert.ok(css.length < 2000);
   assert.doesNotMatch(css, /#[a-f\d]{3,8}\b|font-family|--fwa-/i);
   assert.match(css, /var\(--accent\)/);
+});
+
+
+test('the single workbench keeps requirements, DAG and inspector mounted without section navigation or polling graph recreation', async () => {
+  assert.equal(configs.console.sections, undefined);
+  const shell = JSON.stringify(configs.console.templates.shell);
+  for (const ref of ['request', 'graphHost', 'detail']) assert.ok(shell.includes('"ref":"' + ref + '"'));
+  assert.doesNotMatch(shell, /data-section|高级|FWA 工作台分区/);
+  const source = await readFile(appFile('console.js'), 'utf8');
+  assert.doesNotMatch(source, /showSection|state\.section/);
+  assert.equal((source.match(/graph\?\.destroy\(/g) || []).length, 1, 'Graph is destroyed only on workbench disposal.');
+  assert.match(source, /revision !== graphRevision.*graph\.update/);
 });

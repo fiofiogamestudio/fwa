@@ -39,16 +39,16 @@
     visit(value, '', 0);
     return [...found.values()];
   }
-  function create({ api, select, getStatus, retry, command, getSession, refresh }) {
+  function create({ api, select, getStatus, getWorkAvailability, command, getSession, refresh }) {
     const model = window.FwaWorkbenchModel;
     let disposed = false;
     const reviewDrafts = new Map(), reviewPending = new Set();
     const reviewPanels = new Map();
     const experimentPanels = new Map();
     const experimentDrafts = new Map();
+    const diffPanels = new Map();
     const surface = window.FwaSurface.create('content', { actions: {
       invoke: ({ data, event }) => data.action?.(event),
-      retry: ({ data }) => retry?.(data.id),
       artifact: ({ data }) => showArtifact(data.viewer, data.artifact, data.label),
       reviewDraft: ({ data, element }) => { data.draft[element.name] = element.value; },
       reviewAction: ({ data, element }) => data.invoke(element.dataset.action),
@@ -58,7 +58,7 @@
     const tone = value => ({ neutral: 'muted', error: 'danger', running: 'info', active: 'info' })[model.tone(value)] || model.tone(value) || 'muted';
     const status = value => ({ label: model.statusLabel(value), tone: tone(value) });
     const reviewPhase = value => ({ 'awaiting-human-acceptance': '验证通过，待人工验收', 'validation-failed': '候选验证未通过',
-      accepted: '人工验收已记录', integrated: '已采用', reverted: '已撤销', rejected: '回归未通过', failed: '失败',
+      accepted: '确认已记录', integrated: '已采用', reverted: '已撤销', rejected: '回归未通过', failed: '失败',
       conflict: '存在冲突', integrating: '正在采用', reverting: '正在撤销' })[value] || model.statusLabel(value) || value;
     // Compatibility for controllers requesting one small element. New ordinary
     // compositions should use named templates rather than this compatibility shim.
@@ -131,15 +131,58 @@
         }
       } catch (error) { if (current()) host.replaceChildren(render('errorOutput', { text: error.message })); }
     }
+    function candidateDiff(host, change, owner) {
+      if (!change?.patchArtifact) return;
+      const key = `${owner}/${change.id}/${change.patchArtifact.digest}`;
+      const entry = diffPanels.get(key) || { open: false, loaded: false, loading: false, viewer: render('stack') };
+      if (entry.disclosure) {
+        entry.open = entry.disclosure.open;
+        entry.disclosure.removeEventListener('toggle', entry.listener);
+      }
+      const view = render('candidateDiff', { candidateId: key,
+        files: (change.changedFiles || []).map(file => typeof file === 'string' ? file : JSON.stringify(file)) });
+      host.append(view); view.refs.body.append(entry.viewer); view.open = entry.open;
+      const load = async () => {
+        if (disposed || !view.isConnected || !view.open || entry.loaded || entry.loading) return;
+        entry.loading = true;
+        try {
+          await showArtifact(entry.viewer, change.patchArtifact, surface.text('patchTitle'), 'diff');
+          entry.loaded = entry.viewer.isConnected;
+        } finally { entry.loading = false; }
+      };
+      entry.listener = () => { if (view.isConnected) { entry.open = view.open; if (view.open) void load(); } };
+      entry.disclosure = view; diffPanels.set(key, entry);
+      view.addEventListener('toggle', entry.listener);
+      if (entry.open) void load();
+    }
     function node(host, id) {
-      const data = model.nodeDetails(getStatus(), id);
+      const data = model.nodeWorkbench(getStatus(), id);
       if (!data) { host.append(render('missingNode')); return; }
-      const item = data.node;
-      const view = render('node', { ...item, goalTitle: data.goal?.title ?? surface.text('unrecorded'), runCount: data.runs.length,
-        budget: item.budget || {}, capabilitiesText: (item.capabilities || []).join('、'), blockers: data.blockers,
-        statuses: [status(item.status), status(item.validity), status(item.integrationStatus || '未集成')], canRetry: !!retry });
+      const item = data.node, session = getSession?.(), current = data.activity;
+      const availability = getWorkAvailability?.(id) || model.workAvailability(getStatus(), session, item.goalId, id);
+      const executionBlocker = session?.allowWrite && !availability.allowed && !['delivered', 'historical'].includes(current.state)
+        && availability.reason !== current.reason ? availability.reason : '';
+      const outcome = item.outcome?.trim(), headline = outcome || item.title || id;
+      const completionCount = typeof item.acceptance === 'string' ? 1 : Array.isArray(item.acceptance) ? item.acceptance.length
+        : (item.acceptance?.commands?.length || 0) + (item.acceptance?.checks?.length || 0);
+      const view = render('node', { ...item, ...data, title: item.title, id, headline,
+        activity: { ...current, tone: ({ active: 'info', neutral: 'muted' })[current.tone] || current.tone },
+        nextAction: current.nextAction && current.nextAction !== current.reason && current.nextAction !== executionBlocker
+          && !['查看任务详情。', '查看交付证据。'].includes(current.nextAction) ? current.nextAction : '',
+        acceptanceTitle: `验收标准（${completionCount}）`, dependencyTitle: `依赖（${data.dependencies.length}）`,
+        hasDependencies: data.dependencies.length > 0, hasResult: !!data.change,
+        executionBlocker });
       host.append(view);
-      links(view.refs.dependencies, surface.text('dependencies'), (item.dependsOn || []).map(key => getStatus().nodes.find(n => n.id === key)).filter(Boolean), 'nodes');
+      if (data.change) {
+        candidateDiff(view.refs.resultDiff, data.change, `node/${id}`);
+        if (command) void reviewChange(view.refs.review, data.change.id);
+        view.refs.records.append(resource('changeSets', data.change.id, '查看独立结果记录'));
+      }
+      for (const dependency of data.dependencies) {
+        const dependencyView = render('dependency', { reason: dependency.reason === '依赖原因未记录' ? '原因未记录' : dependency.reason });
+        dependencyView.refs.link.append(resource('nodes', dependency.id, dependency.title));
+        view.refs.dependencies.append(dependencyView);
+      }
       links(view.refs.references, surface.text('references'), data.refs, 'refs');
       links(view.refs.runs, surface.text('runs'), data.runs, 'runs', run => model.statusLabel(run.status) + ' · ' + date(run.startedAt || run.createdAt));
       links(view.refs.changes, surface.text('changes'), data.changeSets, 'changeSets', change => (change.changedFiles?.length ?? 0) + ' 个文件 · ' + short(change.id));
@@ -212,59 +255,60 @@
       const related = state.evidence.filter(entry => entry.changeSetId === id);
       if (related.length) links(view.refs.evidence, surface.text('relatedEvidence'), related, 'evidence', entry => `${model.statusLabel(entry.result)} · ${(entry.criteria || []).map(check => check.id).join('、') || entry.kind}`);
       artifactLinks(view.refs.artifacts, item);
-      if (item.patchArtifact) void showArtifact(view.refs.diff, item.patchArtifact, surface.text('patchTitle'), 'diff');
+      candidateDiff(view.refs.diff, item, 'change');
       view.refs.records.append(record(item));
     }
     async function reviewChange(host, id) {
+      for (const [element, draft] of reviewPanels) if (!element.isConnected) {
+        for (const key of ['impact', 'settings', 'jobs']) draft[key + 'Open'] = element.refs[key].open;
+        reviewPanels.delete(element);
+      }
       const current = () => !disposed && host.isConnected;
       try {
         const review = await api('/api/fwa/review?changeSetId=' + encodeURIComponent(id));
         if (!current()) return;
-        const draft = reviewDrafts.get(id) || { acceptanceNote: '', revertNote: '', profileId: review.profiles[0]?.id || '' };
+        const draft = reviewDrafts.get(id) || { revertNote: '' };
         reviewDrafts.set(id, draft);
-        if (!review.profiles.some(profile => profile.id === draft.profileId)) draft.profileId = review.profiles[0]?.id || '';
         const writable = Boolean(getSession?.()?.allowWrite && !reviewPending.has(id));
-        const jobs = review.jobs.map(job => ({ text: ({ 'change.validate': '验证', 'change.accept': '人工验收', 'change.integrate': '采用', 'change.revert': '撤销' })[job.type]
+        const autoCompletion = (review.completionMode ?? getSession?.()?.review?.completionMode) === 'automatic';
+        const jobs = review.jobs.map(job => ({ text: (({ 'workflow.finish': '确认并继续', 'change.finish': '完成确认', 'change.auto-finish': '自动收束', 'change.policy-accept': '按规则确认', 'change.validate': '验证', 'change.accept': '人工验收', 'change.integrate': '采用', 'change.revert': '撤销' })[job.type] || '操作')
           + ' · ' + (job.state === 'running' ? '执行中' : job.state === 'succeeded' ? job.result?.ok === false ? '未通过：' + reviewPhase(job.result.phase) : '完成：' + reviewPhase(job.result.phase) : reviewPhase(job.state))
           + (job.error ? ' · ' + job.error.message : '') }));
         let view;
         const message = text => { if (current() && view) { view.refs.message.textContent = text; view.refs.message.hidden = !text; } };
         const invoke = async action => {
-          if (!writable || reviewPending.has(id) || !review.actions[action]) return;
+          if (!writable || reviewPending.has(id) || !['finish', 'revert'].includes(action) || !review.actions[action]
+            || action === 'finish' && autoCompletion) return;
           const payload = { changeSetId: id, reviewToken: review.reviewToken };
-          if (action === 'validate') payload.profileId = draft.profileId;
-          if (['accept', 'revert'].includes(action)) {
-            payload.note = (action === 'accept' ? draft.acceptanceNote : draft.revertNote).trim();
-            if (!payload.note) { message(action === 'accept' ? '请填写验收结论。' : '请填写撤销原因。'); return; }
+          if (action === 'revert') {
+            payload.note = draft.revertNote.trim();
+            if (!payload.note) { message('请填写撤销原因。'); return; }
           }
           reviewPending.add(id); view.disabled = true;
           try {
-            await command('change.' + action, payload);
+            await command(action === 'finish' ? 'workflow.finish' : 'change.revert', payload);
             message('正在执行…');
             await refresh?.();
           } catch (error) { message(error.message); }
           finally { reviewPending.delete(id); if (current()) view.disabled = false; }
         };
         const active = review.current !== false && !review.integrated && !review.reverted && review.kind !== 'revert';
-        const showValidate = active && !review.evidenceId && !review.accepted;
-        const showAccept = active && !!review.evidenceId && !review.accepted;
-        const showIntegrate = active && !!review.accepted;
+        const showFinish = active && !!review.evidenceId && !autoCompletion && getSession?.()?.allowWrite === true;
         const latest = review.jobs.at(-1);
         const failureText = latest?.state === 'failed' ? latest.error?.message || '操作失败，请查看操作记录。'
           : latest?.result?.ok === false ? reviewPhase(latest.result.phase) : '';
         view = render('review', { ...review, draft, invoke, jobs, blockers: review.blockers.map(text => ({ text })),
           failureText,
-          showValidate, showAccept, showIntegrate, showRevert: !!review.integrated && !review.reverted,
+          showFinish, autoContinue: active && autoCompletion, showRevert: !!review.integrated && !review.reverted,
           phase: review.kind === 'revert' ? '撤销记录' : review.reverted ? '已撤销' : review.current === false ? '历史候选 · 当前不可采用'
-            : review.integrated ? '已采用' : review.accepted ? '待采用' : review.evidenceId ? '待人工验收' : '待验证',
-          validateDisabled: !writable || !review.actions.validate, acceptDisabled: !writable || !review.actions.accept,
-          integrateDisabled: !writable || !review.actions.integrate, revertDisabled: !writable || !review.actions.revert,
+            : review.integrated ? '已完成并集成' : review.evidenceId ? autoCompletion ? '验证通过，等待自动完成' : '等待确认并继续' : '等待自动验证',
+          profileText: review.profiles.length ? review.profiles.map(profile => profile.id).join('、') : '未匹配到验证配置',
+          finishDisabled: !writable || !review.actions.finish, revertDisabled: !writable || !review.actions.revert,
           impactText: review.impact.nodes.length ? review.impact.nodes.map(node => node.title + (node.willBecomeStale ? '（现有结果将失效）' : '（声明依赖）')).join('；') : '无声明依赖。',
           acceptedText: review.acceptanceRecord?.note || '' });
         host.replaceChildren(view);
         view.refs.message.hidden = true;
         reviewPanels.set(view, draft);
-        surface.setOptions(view.refs.profile, review.profiles.map(profile => ({ label: profile.id, value: profile.id })), draft.profileId);
       } catch (error) { if (current()) host.replaceChildren(render('errorOutput', { text: error.message })); }
     }
     function evidence(host, id) {
@@ -304,7 +348,8 @@
       await load();
       return { refresh: load };
     }
-    function dispose() { if (disposed) return; disposed = true; for (const entry of experimentPanels.values()) entry.panel.dispose(); experimentPanels.clear(); reviewPanels.clear(); surface.dispose(); }
+    function dispose() { if (disposed) return; disposed = true; for (const entry of experimentPanels.values()) entry.panel.dispose(); experimentPanels.clear(); reviewPanels.clear();
+      for (const entry of diffPanels.values()) entry.disclosure.removeEventListener('toggle', entry.listener); diffPanels.clear(); surface.dispose(); }
     return { el, button, badge, record, metadata, documentText, node, ref, run, changeSet, evidence, events, artifactLinks, showArtifact, dispose };
   }
   window.FwaWorkbenchContent = { create };

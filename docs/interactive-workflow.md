@@ -17,7 +17,7 @@ complete autonomous game-delivery system.
 
 The existing standalone CLI contracts and guarded FWE host remain available. UI capability labels describe what this launch can actually do. Missing executor/evaluator capabilities must be shown as blockers, never simulated successes.
 
-Work also stops at `no-changes-awaiting-review` before any automatic acceptance when a batch member has no changed files. This preserves the core's zero-file Run/ChangeSet history while requiring inspection: a no-op is not necessarily a failure, but process exit code zero does not establish task completion. Historical jobs remain immutable; their exact ChangeSet bindings allow the UI to add a zero-change warning.
+An empty candidate remains at `no-changes-awaiting-review`; it is never automatically accepted. Configured machine validation may check independent nonempty peers, while trusted automatic-adoption callbacks pause the mixed batch. This preserves zero-file Run/ChangeSet history while requiring inspection: a no-op is not necessarily a failure, but process exit code zero does not establish task completion. Historical jobs remain immutable; their exact ChangeSet bindings allow the UI to add a zero-change warning.
 
 ## Current implementation
 
@@ -41,10 +41,17 @@ Work also stops at `no-changes-awaiting-review` before any automatic acceptance 
 - Work calls `runReadyBatch`: one coordinator lease, independent member
   worktrees and immutable Runs/ChangeSets, with declared read/write and exclusive
   resource conflicts deferred. The default controller selects at most four
-  leaves per round. It does not provide `acceptAndIntegrate`: after a successful
-  batch it stops at `awaiting-acceptance`, rather than pretending produced is
-  done. With trusted review configuration, the browser can validate the exact
-  candidate, record human acceptance, and request gated adoption/reversion.
+  leaves per round. With trusted review configuration it validates exact
+  candidates automatically, including candidates retained by earlier operations.
+  It repairs ordinary failed attempts within the same request, using retained
+  candidates and bounded verified log excerpts, and supplies configured checks
+  for self-testing before capture. Attempt budgets and consecutive no-progress
+  checks remain enforced. Independent ready work can continue around a blocked
+  branch. Automatic completion follows the configured policy; manual profiles
+  still stop for explicit confirmation.
+  The browser's `workflow.finish` records that confirmation, performs gated
+  adoption through `change.finish`, and continues eligible downstream work with
+  fresh evidence bindings. Successful production or validation alone is not done.
   Recovery remains an explicit CLI/API action. The browser cannot upload an
   executable or acceptance profile. See [change-review.md](change-review.md).
 - `node.feedback` records pending input without changing an active Run.
@@ -62,9 +69,11 @@ Work also stops at `no-changes-awaiting-review` before any automatic acceptance 
   capture and visual acceptance remain project-specific. Console recordings
   and reference art are not game evidence; a hash proves byte identity, not content.
 
-Named acceptance contracts and deletion/renaming of existing logical leaves
-cannot be silently rewritten by the model planner; use an explicit authored
-revision. A revision is not an automatic Git rollback. Original commits and
+Named acceptance contracts cannot be partitioned by the model planner. An
+unstarted result can derive bounded children through a versioned revision;
+replacement must preserve its acceptance obligations and consumers. Attempted
+results retain their logical identity and retry budget. See
+[node-workbench.md](node-workbench.md). A revision is not an automatic Git rollback. Original commits and
 their acceptance/integration/reversion histories remain separate facts.
 
 ## 启动配置
