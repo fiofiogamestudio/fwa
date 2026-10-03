@@ -15,7 +15,7 @@ import {
   GitProcessGuard,
   runGitProcess
 } from '../src/adapters/git-process.js';
-import { GitWorktreeAdapter } from '../src/adapters/git-worktree.js';
+import { GitWorktreeAdapter, GitWorktreeError } from '../src/adapters/git-worktree.js';
 import { GitIntegrationAdapter } from '../src/adapters/git-integration.js';
 import { GitIntegrationWorkspaceAdapter } from '../src/adapters/git-integration-workspace.js';
 import { recordGitProcessFence } from '../src/adapters/git-process-fence.js';
@@ -389,17 +389,32 @@ test('real checkout hook timeout is bounded, preserves its worktree, then allows
   await git(['add', '.gitignore', 'seed.txt']);
   await git(['commit', '-m', 'test: initial']);
   const hook = path.join(root, '.git', 'hooks', 'post-checkout');
-  await writeFile(hook, '#!/bin/sh\nsleep 3\n');
+  await writeFile(hook, '#!/bin/sh\nprintf started > .fwa-hook-started\nsleep 10\n');
   if (process.platform !== 'win32') await chmod(hook, 0o755);
-  const subject = new GitWorktreeAdapter(root, { gitTimeoutMs: 500, gitTerminationGraceMs: 5_000 });
+  const hookTimeoutMs = 5_000;
+  const subject = new GitWorktreeAdapter(root, {
+    gitTimeoutMs: 10_000,
+    // Real Windows process-tree cleanup may be delayed under parallel Git load;
+    // exact small termination deadlines are covered by the deterministic tests.
+    gitTerminationGraceMs: 15_000,
+    // Only the intentionally sleeping hook receives the short deadline. Slow
+    // prerequisite rev-parse/status calls must not impersonate a hook timeout.
+    gitRunner: (executable, args, options) => runGitProcess(executable, args, {
+      ...options,
+      ErrorType: GitWorktreeError,
+      timeoutMs: args[0] === 'worktree' && args[1] === 'add' ? hookTimeoutMs : options.timeoutMs
+    })
+  });
   await assert.rejects(subject.create({ runId: 'hook_timeout' }), (error) => (
     error.code === 'git-command-timeout'
     && error.details.arguments[0] === 'worktree'
     && error.details.arguments[1] === 'add'
+    && error.details.timeoutMs === hookTimeoutMs
     && error.details.terminationConfirmed === true
   ));
   assert.equal((await subject.inspectProcessFence()).held, false);
   assert.equal((await lstat(path.join(root, '.fwa', 'worktrees', 'hook_timeout'))).isDirectory(), true);
+  assert.equal(await readFile(path.join(root, '.fwa', 'worktrees', 'hook_timeout', '.fwa-hook-started'), 'utf8'), 'started');
   const cleanup = await new GitWorktreeAdapter(root).remove({ runId: 'hook_timeout', force: true });
   assert.equal(cleanup.removed, true);
 });

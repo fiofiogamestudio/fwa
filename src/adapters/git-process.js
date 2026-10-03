@@ -150,7 +150,9 @@ async function taskkill(pid, timeoutMs) {
 
 async function terminateTree(child, platform, isClosed, graceMs) {
   if (platform === 'win32' && Number.isSafeInteger(child.pid) && child.pid > 0) {
-    await taskkill(child.pid, Math.min(2_000, graceMs));
+    // The helper shares the outer grace: leave time for the managed-child
+    // fallback and its close event instead of spending the entire deadline.
+    await taskkill(child.pid, Math.min(2_000, Math.max(1, Math.floor(graceMs / 2))));
     if (isClosed()) return;
   } else if (Number.isSafeInteger(child.pid) && child.pid > 0) {
     try {
