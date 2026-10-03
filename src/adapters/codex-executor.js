@@ -9,8 +9,10 @@ import { EXECUTOR_SCHEMA_VERSION, assertExecutor } from '../core/executor.js';
 export const CODEX_EXECUTOR_INPUT_SCHEMA_VERSION = 1;
 export const CODEX_CODE_EDIT_CAPABILITY = 'code_edit';
 export const CODEX_SHELL_CAPABILITY = 'shell';
-export const DEFAULT_CODEX_TIMEOUT_MS = 30 * 60 * 1000;
-export const MAX_CODEX_TIMEOUT_MS = 30 * 60 * 1000;
+export const DEFAULT_CODEX_TIMEOUT_MS = null;
+export const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+// Node timers use a signed 32-bit delay; larger values otherwise fire after 1 ms.
+export const MAX_CODEX_TIMEOUT_MS = 2_147_483_647;
 export const DEFAULT_CODEX_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
 export const MAX_CODEX_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_CODEX_TERMINATION_GRACE_MS = 5_000;
@@ -74,6 +76,108 @@ function requireDuration(value, name, maximum) {
     );
   }
   return value;
+}
+
+function samePath(left, right) {
+  const a = path.resolve(left);
+  const b = path.resolve(right);
+  return process.platform === 'win32'
+    ? a.toLocaleLowerCase('en-US') === b.toLocaleLowerCase('en-US')
+    : a === b;
+}
+
+function pathContains(parent, child) {
+  const relative = path.relative(path.resolve(parent), path.resolve(child));
+  return relative === '' || (
+    relative !== '..'
+    && !relative.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relative)
+  );
+}
+
+function normalizeAdditionalWritableRoots(value) {
+  if (value === undefined) return Object.freeze([]);
+  if (!Array.isArray(value)) {
+    throw new CodexExecutorError(
+      'FWA_INVALID_CODEX_EXECUTOR_OPTIONS',
+      'additionalWritableRoots must be an array of absolute directory paths.'
+    );
+  }
+  const seen = new Set();
+  const roots = value.map((item, index) => {
+    const name = `additionalWritableRoots[${index}]`;
+    const root = requireString(item, name, 'FWA_INVALID_CODEX_EXECUTOR_OPTIONS');
+    if (!path.isAbsolute(root)) {
+      throw new CodexExecutorError(
+        'FWA_INVALID_CODEX_EXECUTOR_OPTIONS',
+        `${name} must be an absolute directory path.`
+      );
+    }
+    const resolved = path.resolve(root);
+    const key = process.platform === 'win32'
+      ? resolved.toLocaleLowerCase('en-US')
+      : resolved;
+    if (seen.has(key)) {
+      throw new CodexExecutorError(
+        'FWA_INVALID_CODEX_EXECUTOR_OPTIONS',
+        `${name} duplicates another additional writable root.`
+      );
+    }
+    seen.add(key);
+    return resolved;
+  });
+  return Object.freeze(roots);
+}
+
+async function resolveAdditionalWritableRoots(roots, workspaceRoot) {
+  const resolved = [];
+  for (const [index, root] of roots.entries()) {
+    let information;
+    try {
+      information = await lstat(root);
+    } catch (error) {
+      throw new CodexExecutorError(
+        'FWA_INVALID_CODEX_EXECUTOR_OPTIONS',
+        `additionalWritableRoots[${index}] does not exist: ${root}.`,
+        { path: root, error: safeError(error) }
+      );
+    }
+    if (!information.isDirectory() || information.isSymbolicLink()) {
+      throw new CodexExecutorError(
+        'FWA_INVALID_CODEX_EXECUTOR_OPTIONS',
+        `additionalWritableRoots[${index}] must be an existing ordinary directory, not a link or file.`,
+        { path: root }
+      );
+    }
+    let canonical;
+    try {
+      canonical = await realpath(root);
+      const canonicalInformation = await stat(canonical);
+      if (!canonicalInformation.isDirectory() || !samePath(canonical, root)) {
+        throw new Error('directory is not a canonical ordinary directory');
+      }
+    } catch (error) {
+      throw new CodexExecutorError(
+        'FWA_INVALID_CODEX_EXECUTOR_OPTIONS',
+        `additionalWritableRoots[${index}] must resolve to the same existing ordinary directory without links: ${root}.`,
+        { path: root, error: safeError(error) }
+      );
+    }
+    if (pathContains(workspaceRoot, canonical) || pathContains(canonical, workspaceRoot)) {
+      throw new CodexExecutorError(
+        'FWA_INVALID_CODEX_EXECUTOR_OPTIONS',
+        `additionalWritableRoots[${index}] must be disjoint from the Codex workspace.`,
+        { path: canonical, workspaceRoot }
+      );
+    }
+    resolved.push(canonical);
+  }
+  return Object.freeze(resolved);
+}
+
+function normalizeTimeout(value, name = 'timeoutMs') {
+  if (value === null || value === 0) return null;
+  return requireDuration(value, name, MAX_CODEX_TIMEOUT_MS);
 }
 
 function requireOutputLimit(value) {
@@ -370,13 +474,22 @@ function normalizeInput(input, defaultModel) {
       `Expected Codex executor input schema version ${CODEX_EXECUTOR_INPUT_SCHEMA_VERSION}.`
     );
   }
-  const prompt = requireString(input.prompt, 'input.prompt');
+  const prompt = input.prompt;
+  const promptReason = typeof prompt !== 'string' ? 'prompt-type'
+    : !prompt.length ? 'prompt-empty'
+      : prompt.includes('\0') ? 'prompt-nul'
+        : prompt !== prompt.trim() ? 'prompt-whitespace' : null;
+  if (promptReason !== null) {
+    throw new CodexExecutorError('FWA_INVALID_CODEX_EXECUTOR_INPUT',
+      'input.prompt must be a non-empty, trimmed string without NUL bytes.',
+      { field: 'prompt', reason: promptReason });
+  }
   const promptBytes = Buffer.byteLength(prompt, 'utf8');
   if (promptBytes > MAX_CODEX_PROMPT_BYTES) {
     throw new CodexExecutorError(
       'FWA_INVALID_CODEX_EXECUTOR_INPUT',
       `input.prompt exceeds the ${MAX_CODEX_PROMPT_BYTES}-byte limit.`,
-      { promptBytes, limitBytes: MAX_CODEX_PROMPT_BYTES }
+      { field: 'prompt', reason: 'prompt-too-large', promptBytes, limitBytes: MAX_CODEX_PROMPT_BYTES }
     );
   }
   const model = input.model === undefined
@@ -566,6 +679,7 @@ function processSnapshot(raw) {
     signal: raw.signal,
     terminationConfirmed: true,
     timedOut: raw.stopReason?.code === 'FWA_CODEX_TIMEOUT',
+    idleTimedOut: raw.stopReason?.code === 'FWA_CODEX_IDLE_TIMEOUT',
     aborted: raw.stopReason?.code === 'FWA_CODEX_ABORTED',
     durationMs: raw.durationMs,
     stdout: raw.stdout.text,
@@ -587,6 +701,7 @@ async function runCodex({
   prompt,
   outputLimitBytes,
   timeoutMs,
+  idleTimeoutMs,
   terminationGraceMs,
   signal,
   spawnImpl,
@@ -641,9 +756,11 @@ async function runCodex({
     let processError = null;
     let termination = null;
     let timeout;
+    let idleTimeout;
     let terminationDeadline;
     const cleanup = () => {
       clearTimeout(timeout);
+      clearTimeout(idleTimeout);
       clearTimeout(terminationDeadline);
       signal?.removeEventListener('abort', onAbort);
     };
@@ -670,6 +787,7 @@ async function runCodex({
             signal: null,
             terminationConfirmed: false,
             timedOut: stopReason?.code === 'FWA_CODEX_TIMEOUT',
+            idleTimedOut: stopReason?.code === 'FWA_CODEX_IDLE_TIMEOUT',
             aborted: stopReason?.code === 'FWA_CODEX_ABORTED',
             durationMs: Math.max(0, Date.now() - startedAt),
             stdout: stdout.result().text,
@@ -688,6 +806,7 @@ async function runCodex({
     function requestStop(reason) {
       if (stopReason !== null || closed) return;
       stopReason = reason;
+      clearTimeout(idleTimeout);
       termination = terminateProcessTree(
         child,
         platform,
@@ -704,9 +823,22 @@ async function runCodex({
       });
     }
 
-    child.stdout.on('data', stdout.onData);
+    function resetIdleTimeout() {
+      clearTimeout(idleTimeout);
+      if (idleTimeoutMs === null || settled || closed || stopReason !== null) return;
+      idleTimeout = setTimeout(() => requestStop({
+        code: 'FWA_CODEX_IDLE_TIMEOUT',
+        message: `Codex produced no stdout or stderr bytes for ${idleTimeoutMs} ms.`,
+        details: { idleTimeoutMs }
+      }), idleTimeoutMs);
+    }
+    const receive = collector => chunk => {
+      if (Buffer.byteLength(chunk) > 0) resetIdleTimeout();
+      collector.onData(chunk);
+    };
+    child.stdout.on('data', receive(stdout));
     child.stdout.on('error', stdout.onError);
-    child.stderr.on('data', stderr.onData);
+    child.stderr.on('data', receive(stderr));
     child.stderr.on('error', stderr.onError);
     child.stdin.on?.('error', (error) => requestStop({
       code: 'FWA_CODEX_INPUT_STREAM_FAILED',
@@ -738,11 +870,14 @@ async function runCodex({
       });
     });
     signal?.addEventListener('abort', onAbort, { once: true });
-    timeout = setTimeout(() => requestStop({
-      code: 'FWA_CODEX_TIMEOUT',
-      message: `Codex execution exceeded its ${timeoutMs} ms timeout.`,
-      details: { timeoutMs }
-    }), timeoutMs);
+    resetIdleTimeout();
+    if (timeoutMs !== null) {
+      timeout = setTimeout(() => requestStop({
+        code: 'FWA_CODEX_TIMEOUT',
+        message: `Codex execution exceeded its ${timeoutMs} ms timeout.`,
+        details: { timeoutMs }
+      }), timeoutMs);
+    }
     if (signal?.aborted) {
       onAbort();
       return;
@@ -874,8 +1009,10 @@ export class CodexExecutor {
   #spawn;
   #terminationGraceMs;
   #timeoutMs;
+  #idleTimeoutMs;
   #sandbox;
   #outputSchema;
+  #additionalWritableRoots;
 
   constructor(options = {}) {
     if (!isPlainObject(options)) {
@@ -909,15 +1046,20 @@ export class CodexExecutor {
     if (!['read-only', 'workspace-write'].includes(this.#sandbox)) {
       throw new CodexExecutorError('FWA_INVALID_CODEX_EXECUTOR_OPTIONS', 'sandbox must be read-only or workspace-write.');
     }
+    this.#additionalWritableRoots = normalizeAdditionalWritableRoots(options.additionalWritableRoots);
+    if (this.#additionalWritableRoots.length > 0 && this.#sandbox !== 'workspace-write') {
+      throw new CodexExecutorError(
+        'FWA_INVALID_CODEX_EXECUTOR_OPTIONS',
+        'additionalWritableRoots require the workspace-write sandbox.'
+      );
+    }
     this.#outputSchema = options.outputSchema ?? null;
     if (this.#outputSchema !== null && (typeof this.#outputSchema !== 'string' || !path.isAbsolute(this.#outputSchema))) {
       throw new CodexExecutorError('FWA_INVALID_CODEX_EXECUTOR_OPTIONS', 'outputSchema must be an absolute, server-selected file path.');
     }
-    this.#timeoutMs = requireDuration(
-      options.timeoutMs ?? DEFAULT_CODEX_TIMEOUT_MS,
-      'timeoutMs',
-      MAX_CODEX_TIMEOUT_MS
-    );
+    this.#timeoutMs = normalizeTimeout(options.timeoutMs ?? DEFAULT_CODEX_TIMEOUT_MS);
+    this.#idleTimeoutMs = normalizeTimeout(options.idleTimeoutMs === undefined
+      ? DEFAULT_CODEX_IDLE_TIMEOUT_MS : options.idleTimeoutMs, 'idleTimeoutMs');
     this.#outputLimitBytes = requireOutputLimit(
       options.outputLimitBytes ?? DEFAULT_CODEX_OUTPUT_LIMIT_BYTES
     );
@@ -939,6 +1081,11 @@ export class CodexExecutor {
     assertExecutor(this);
   }
 
+  validateInput(input) {
+    const normalized = normalizeInput(input, this.#defaultModel);
+    return { ok: true, promptBytes: normalized.promptBytes };
+  }
+
   async execute({ workspaceRoot, node, input, signal } = {}) {
     assertSignal(signal);
     const root = await resolveWorkspaceRoot(workspaceRoot);
@@ -951,6 +1098,10 @@ export class CodexExecutor {
       );
     }
     const normalized = normalizeInput(input, this.#defaultModel);
+    const additionalWritableRoots = await resolveAdditionalWritableRoots(
+      this.#additionalWritableRoots,
+      root
+    );
     for (const imagePath of normalized.images) {
       const info = await lstat(imagePath);
       if (!info.isFile() || info.isSymbolicLink() || info.size > 16 * 1024 * 1024) {
@@ -986,6 +1137,7 @@ export class CodexExecutor {
       ...normalized.images.flatMap(imagePath => ['--image', imagePath]),
       '--cd',
       root,
+      ...additionalWritableRoots.flatMap((writableRoot) => ['--add-dir', writableRoot]),
       ...(normalized.model === null ? [] : ['--model', normalized.model]),
       '-'
     ];
@@ -999,6 +1151,7 @@ export class CodexExecutor {
       ephemeral: true,
       ignoreUserConfig: normalized.ignoreUserConfig,
       windowsSandboxOverride: normalized.windowsSandboxOverride,
+      additionalWritableRoots: [...additionalWritableRoots],
       sandbox: normalized.windowsSandboxOverride === 'elevated'
         ? 'windows-elevated'
         : `${this.#sandbox}-requested`,
@@ -1033,6 +1186,7 @@ export class CodexExecutor {
       prompt: normalized.prompt,
       outputLimitBytes: this.#outputLimitBytes,
       timeoutMs: this.#timeoutMs,
+      idleTimeoutMs: this.#idleTimeoutMs,
       terminationGraceMs: this.#terminationGraceMs,
       signal,
       spawnImpl: this.#spawn,

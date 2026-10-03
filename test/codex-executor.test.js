@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import {
   mkdir,
@@ -15,7 +16,9 @@ import test from 'node:test';
 import {
   CODEX_EXECUTOR_INPUT_SCHEMA_VERSION,
   CodexExecutor,
-  CodexExecutorError
+  CodexExecutorError,
+  DEFAULT_CODEX_TIMEOUT_MS,
+  MAX_CODEX_TIMEOUT_MS
 } from '../src/adapters/codex-executor.js';
 import { assertExecutor } from '../src/core/executor.js';
 
@@ -93,12 +96,54 @@ test('planning uses explicit read-only sandbox and schema without accepting broa
   const executor = new CodexExecutor({ executable: 'fake-codex', platform: 'linux', spawnImpl: fake.spawnImpl, sandbox: 'read-only', outputSchema: schema });
   const result = await executor.execute({ workspaceRoot, node: projectionNode(), input: codexInput() });
   assert.equal(result.codex.sandbox, 'read-only-requested');
+  assert.deepEqual(result.codex.additionalWritableRoots, []);
   assert.equal(fake.calls[0].args[fake.calls[0].args.indexOf('--sandbox') + 1], 'read-only');
   assert.equal(fake.calls[0].args[fake.calls[0].args.indexOf('--output-schema') + 1], schema);
   assert.ok(!fake.calls[0].args.includes('--full-auto'));
   assert.throws(() => new CodexExecutor({ sandbox: 'danger-full-access' }), { code: 'FWA_INVALID_CODEX_EXECUTOR_OPTIONS' });
   await assert.rejects(executor.execute({ workspaceRoot, node: projectionNode(), input: codexInput({ windowsSandboxOverride: 'elevated' }) }), { code: 'FWA_INVALID_CODEX_EXECUTOR_INPUT' });
   assert.equal(fake.calls.length, 1);
+});
+
+test('passes only validated disjoint writable roots through the native invocation', async () => {
+  const workspaceRoot = await temporaryWorkspace();
+  const writableRoot = await temporaryWorkspace();
+  const fake = createSpawnFake(({ child, close }) => {
+    child.stdout.end('{"type":"turn.completed"}\n');
+    child.stderr.end();
+    close(0);
+  });
+  const executor = new CodexExecutor({
+    executable: 'fake-codex',
+    platform: 'linux',
+    spawnImpl: fake.spawnImpl,
+    additionalWritableRoots: [writableRoot]
+  });
+
+  const result = await executor.execute({ workspaceRoot, node: projectionNode(), input: codexInput() });
+  const addDir = fake.calls[0].args.indexOf('--add-dir');
+  assert.notEqual(addDir, -1);
+  assert.equal(fake.calls[0].args[addDir + 1], path.resolve(writableRoot));
+  assert.deepEqual(result.codex.additionalWritableRoots, [path.resolve(writableRoot)]);
+  assert.equal(fake.calls[0].args[fake.calls[0].args.indexOf('--sandbox') + 1], 'workspace-write');
+});
+
+test('rejects malformed, missing, overlapping, and read-only additional roots', async () => {
+  const workspaceRoot = await temporaryWorkspace();
+  assert.throws(() => new CodexExecutor({ additionalWritableRoots: 'not-an-array' }), { code: 'FWA_INVALID_CODEX_EXECUTOR_OPTIONS' });
+  assert.throws(() => new CodexExecutor({ additionalWritableRoots: ['relative'] }), { code: 'FWA_INVALID_CODEX_EXECUTOR_OPTIONS' });
+  assert.throws(() => new CodexExecutor({ additionalWritableRoots: [workspaceRoot, workspaceRoot] }), { code: 'FWA_INVALID_CODEX_EXECUTOR_OPTIONS' });
+  assert.throws(() => new CodexExecutor({ sandbox: 'read-only', additionalWritableRoots: [workspaceRoot] }), { code: 'FWA_INVALID_CODEX_EXECUTOR_OPTIONS' });
+
+  const filePath = path.join(workspaceRoot, 'not-a-directory');
+  await writeFile(filePath, 'fixture');
+  const missing = path.join(workspaceRoot, 'missing-directory');
+  const fileExecutor = new CodexExecutor({ executable: 'fake-codex', platform: 'linux', spawnImpl: createSpawnFake(() => {}).spawnImpl, additionalWritableRoots: [filePath] });
+  await assert.rejects(fileExecutor.execute({ workspaceRoot: await temporaryWorkspace(), node: projectionNode(), input: codexInput() }), { code: 'FWA_INVALID_CODEX_EXECUTOR_OPTIONS' });
+  const missingExecutor = new CodexExecutor({ executable: 'fake-codex', platform: 'linux', spawnImpl: createSpawnFake(() => {}).spawnImpl, additionalWritableRoots: [missing] });
+  await assert.rejects(missingExecutor.execute({ workspaceRoot, node: projectionNode(), input: codexInput() }), { code: 'FWA_INVALID_CODEX_EXECUTOR_OPTIONS' });
+  const overlapExecutor = new CodexExecutor({ executable: 'fake-codex', platform: 'linux', spawnImpl: createSpawnFake(() => {}).spawnImpl, additionalWritableRoots: [workspaceRoot] });
+  await assert.rejects(overlapExecutor.execute({ workspaceRoot, node: projectionNode(), input: codexInput() }), { code: 'FWA_INVALID_CODEX_EXECUTOR_OPTIONS' });
 });
 
 test('is a core-compatible executor and invokes non-interactive Codex with fixed cwd', async () => {
@@ -362,6 +407,84 @@ test('reports a non-zero Codex exit with invocation and bounded process evidence
       && error.details.process.stderr === 'model unavailable\n'
       && error.details.process.terminationConfirmed === true
   );
+});
+
+test('default, null and zero timeout allow completion beyond the former 30-minute limit', async (t) => {
+  const workspaceRoot = await temporaryWorkspace();
+  t.mock.timers.enable();
+  for (const options of [{}, { timeoutMs: null }, { timeoutMs: 0 }]) {
+    let started;
+    const spawned = new Promise(resolve => { started = resolve; });
+    const fake = createSpawnFake(controls => started(controls));
+    const executor = new CodexExecutor({ executable: 'fake-codex', platform: 'linux', spawnImpl: fake.spawnImpl, idleTimeoutMs: null, ...options });
+    const execution = executor.execute({ workspaceRoot, node: projectionNode(), input: codexInput() })
+      .then(result => ({ result }), error => ({ error }));
+    const { child, close } = await spawned;
+    t.mock.timers.tick(31 * 60 * 1000);
+    assert.deepEqual(fake.calls[0].kills, []);
+    child.stdout.end('{"type":"turn.completed"}\n');
+    child.stderr.end();
+    close(0);
+    const outcome = await execution;
+    assert.equal(outcome.error, undefined);
+    assert.equal(outcome.result.ok, true);
+    assert.equal(outcome.result.process.timedOut, false);
+  }
+});
+
+test('timeout options reject invalid and overflowing Node timer delays', () => {
+  assert.equal(DEFAULT_CODEX_TIMEOUT_MS, null);
+  assert.equal(MAX_CODEX_TIMEOUT_MS, 2_147_483_647);
+  for (const timeoutMs of [undefined, null, 0, 1, 31 * 60 * 1000, MAX_CODEX_TIMEOUT_MS]) {
+    assert.doesNotThrow(() => new CodexExecutor({ timeoutMs }));
+  }
+  for (const timeoutMs of [-1, 0.5, NaN, Infinity, '0', false, {}, MAX_CODEX_TIMEOUT_MS + 1]) {
+    assert.throws(() => new CodexExecutor({ timeoutMs }), { code: 'FWA_INVALID_CODEX_EXECUTOR_OPTIONS' });
+  }
+});
+
+test('real child completion, cancellation and explicit timeout retain process-close confirmation', { timeout: 20_000 }, async (t) => {
+  for (const mode of ['complete', 'cancel', 'timeout']) {
+    await t.test(mode, async () => {
+      const workspaceRoot = await temporaryWorkspace();
+      const fixture = path.join(workspaceRoot, 'codex-fixture.mjs');
+      await writeFile(fixture, [
+        'process.stdin.resume();',
+        'console.log(JSON.stringify({ type: "thread.started" }));',
+        'setTimeout(() => console.log(JSON.stringify({ type: "turn.completed" })), Number(process.argv[2]));'
+      ].join('\n'));
+      const controller = new AbortController();
+      let child;
+      const executor = new CodexExecutor({
+        executable: process.execPath,
+        ...(mode === 'cancel' ? { timeoutMs: null } : mode === 'timeout' ? { timeoutMs: 100 } : {}),
+        spawnImpl: (_executable, _args, options) => {
+          child = spawn(process.execPath, [fixture, mode === 'complete' ? '20' : '10000'], options);
+          if (mode === 'cancel') child.stdout.once('data', () => controller.abort());
+          return child;
+        }
+      });
+      try {
+        const execution = executor.execute({ workspaceRoot, node: projectionNode(), input: codexInput(), signal: controller.signal });
+        if (mode === 'complete') {
+          const result = await execution;
+          assert.equal(result.ok, true);
+          assert.equal(result.process.timedOut, false);
+          assert.equal(result.process.terminationConfirmed, true);
+        } else {
+          await assert.rejects(execution, error => {
+            assert.equal(error.code, mode === 'cancel' ? 'FWA_CODEX_ABORTED' : 'FWA_CODEX_TIMEOUT');
+            assert.equal(error.details.process.terminationConfirmed, true);
+            assert.equal(error.details.process.aborted, mode === 'cancel');
+            assert.equal(error.details.process.timedOut, mode === 'timeout');
+            return true;
+          });
+        }
+      } finally {
+        if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      }
+    });
+  }
 });
 
 test('terminates the direct child and waits for close after a timeout', async () => {
