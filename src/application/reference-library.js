@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, readdir, unlink } from 'node:fs/promises';
+import { lstat, mkdir, open, opendir, readdir, rename, rm, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { boundedBase64, canonical, digest, libraryError, libraryPath, normalizeEntries, publish,
   REFERENCE_LIBRARY_LIMITS, safeDirectory, safeRead } from '../storage/library-files.js';
@@ -33,6 +33,42 @@ function contentType(file) {
   return ({ '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif',
     '.svg': 'image/svg+xml', '.mp4': 'video/mp4', '.webm': 'video/webm', '.mp3': 'audio/mpeg', '.wav': 'audio/wav',
     '.md': 'text/plain', '.txt': 'text/plain', '.json': 'application/json', '.pdf': 'application/pdf' })[path.extname(file).toLowerCase()] || 'application/octet-stream';
+}
+
+async function verifySnapshot(destination, files) {
+  const expected = new Map(files.map(file => [file.path, file]));
+  // An explicit readable child can override a denied directory. Its physical
+  // ancestor directories still exist without granting access to other children.
+  for (const file of files) {
+    const parts = file.path.split('/');
+    for (let length = 1; length < parts.length; length++) {
+      const parent = parts.slice(0, length).join('/');
+      if (!expected.has(parent)) expected.set(parent, { path: parent, type: 'directory' });
+    }
+  }
+  let count = 0;
+  const inspect = async (relative = '') => {
+    const directory = path.join(destination, relative);
+    await safeDirectory(path.parse(destination).root, directory);
+    const entries = await opendir(directory);
+    for await (const entry of entries) {
+      const name = relative ? `${relative}/${entry.name}` : entry.name;
+      const file = expected.get(name);
+      if (!file || ++count > expected.size || entry.isSymbolicLink()
+        || (file.type === 'directory' ? !entry.isDirectory() : !entry.isFile())) {
+        throw libraryError('library-snapshot-mismatch', 'Reference snapshot has unexpected paths or file types.');
+      }
+      if (file.type === 'directory') await inspect(name);
+      else {
+        const bytes = await safeRead(destination, path.join(destination, name), file.size);
+        if (bytes.length !== file.size || digest(bytes) !== file.hash) {
+          throw libraryError('library-snapshot-mismatch', 'Reference snapshot content does not match the pinned manifest.');
+        }
+      }
+    }
+  };
+  await inspect();
+  if (count !== expected.size) throw libraryError('library-snapshot-mismatch', 'Reference snapshot is incomplete.');
 }
 
 /**
@@ -210,8 +246,9 @@ export class ReferenceLibrary {
       versionId: version.versionId, version: `library:${version.versionId}`, hash: version.hash, manifestHash: version.hash,
       materializationRequired: true, ordinaryWorkspaceRef: false };
   }
-  async materializeSnapshot({ libraryId, versionId, destinationRoot, authorized = false } = {}) {
-    if (authorized !== true || typeof destinationRoot !== 'string' || !path.isAbsolute(destinationRoot)) throw libraryError('library-materialization-not-authorized', 'A trusted caller must explicitly authorize an absolute, new destination.');
+  async materializeSnapshot({ libraryId, versionId, destinationRoot, authorized = false,
+    reuseExisting = false, expectedPermissionHash } = {}) {
+    if (authorized !== true || typeof destinationRoot !== 'string' || !path.isAbsolute(destinationRoot)) throw libraryError('library-materialization-not-authorized', 'A trusted caller must explicitly authorize an absolute snapshot destination.');
     const destination = path.resolve(destinationRoot), relative = path.relative(this.projectRoot, destination);
     if (relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative) && !relative.startsWith(`.fwa${path.sep}`))) {
       throw libraryError('library-workspace-write-denied', 'Materialization inside a project is restricted to ignored .fwa state, not project/ or fw/.');
@@ -219,27 +256,53 @@ export class ReferenceLibrary {
     const withinLibrary = path.relative(this.root, destination);
     if (withinLibrary === '' || (!path.isAbsolute(withinLibrary) && withinLibrary !== '..' && !withinLibrary.startsWith(`..${path.sep}`))) throw libraryError('library-unsafe-destination', 'Snapshot cannot overwrite library storage.');
     await safeDirectory(path.parse(destination).root, path.dirname(destination));
-    try { await lstat(destination); throw libraryError('library-destination-exists', 'Snapshot destination must not exist.'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    let exists = false;
+    try { await lstat(destination); exists = true; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (exists && reuseExisting !== true) throw libraryError('library-destination-exists', 'Snapshot destination must not exist.');
     const version = await this.#version(libraryId, versionId), files = [], omitted = [];
+    if (expectedPermissionHash !== undefined && expectedPermissionHash !== version.permissionHash) {
+      throw libraryError('library-permission-changed', 'Reference permissions changed while preparing the snapshot.');
+    }
     for (const entry of version.entries) {
       const permission = accessFor(entry.path, version.library.permissions);
       if (permission.access === 'deny') { omitted.push(entry.path); continue; }
       files.push({ ...entry, permission, ...(entry.type === 'file' ? { bytes: await this.#readEntry(entry) } : {}) });
     }
-    // Verification precedes writes. mkdir reserves this new destination without
-    // replacing an existing path; failures remain explicit incomplete snapshots.
-    await mkdir(destination, { mode: 0o700 });
-    try {
-      for (const file of files) {
-        const target = path.join(destination, ...file.path.split('/'));
-        if (file.type === 'directory') await safeDirectory(destination, target, true);
-        else {
-          await safeDirectory(destination, path.dirname(target), true);
-          const handle = await open(target, 'wx', 0o600);
-          try { await handle.writeFile(file.bytes); await handle.sync(); } finally { await handle.close(); }
+    // Reuse is explicit, verified and never a repair of suspect cached bytes.
+    // Publish reusable snapshots only after their entire tree is written.
+    const staging = reuseExisting === true && !exists
+      ? path.join(path.dirname(destination), `.snapshot-${randomUUID()}.tmp`) : null;
+    const writeRoot = staging ?? destination;
+    if (exists) await verifySnapshot(destination, files);
+    else {
+      await mkdir(writeRoot, { mode: 0o700 });
+      try {
+        for (const file of files) {
+          const target = path.join(writeRoot, ...file.path.split('/'));
+          if (file.type === 'directory') await safeDirectory(writeRoot, target, true);
+          else {
+            await safeDirectory(writeRoot, path.dirname(target), true);
+            const handle = await open(target, 'wx', 0o600);
+            try { await handle.writeFile(file.bytes); await handle.sync(); } finally { await handle.close(); }
+          }
+        }
+        if (staging) {
+          try { await rename(staging, destination); }
+          catch (error) {
+            if (!['EEXIST', 'ENOTEMPTY', 'EPERM'].includes(error.code)) throw error;
+            // Another caller may have published this same immutable version.
+            await verifySnapshot(destination, files);
+          }
+        }
+      } catch (error) { error.partialDestination = writeRoot; throw error; }
+      finally {
+        if (staging) {
+          // Only our unpredictable, sibling staging path is eligible for cleanup.
+          await safeDirectory(path.parse(staging).root, path.dirname(staging));
+          await rm(staging, { recursive: true, force: true });
         }
       }
-    } catch (error) { error.partialDestination = destination; throw error; }
+    }
     return { destinationRoot: destination, libraryId, versionId: version.versionId, hash: version.hash, manifestHash: version.hash,
       permissionSequence: version.permissionSequence, permissionHash: version.permissionHash, files: files.map(({ bytes, ...entry }) => entry), omitted,
       permissionEnforcement: 'caller-must-enforce; copied-file-mode-is-not-an-executor-sandbox' };

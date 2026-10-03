@@ -5,5 +5,8 @@ export * from './events.js';
 export * from './executor.js';
 export * from './invalidation.js';
 export * from './refs.js';
+export * from './failure-diagnostics.js';
+export * from './retry-diagnostics.js';
+export * from './plan-diagnostics.js';
 export { areNodeDependenciesSatisfied, isNodeSchedulable, nodeRetryEligibility } from './scheduling.js';
 export * from './state-machines.js';

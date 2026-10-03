@@ -62,6 +62,19 @@ spawn processes or invoke Git.
 accepts executor, evaluator, workspace, promotion, artifact, event-store, and
 lease ports.
 
+Artifact-store public reads and writes share a per-directory queue across
+instances in the same process. Reads can inspect or recover temporary files,
+so they must not inspect another in-flight publication as an orphan. Internal
+operations do not re-enter the queue. Hash, path and orphan checks remain
+unchanged. This creates no durable lock and is not cross-process coordination;
+project operation leases retain that responsibility.
+
+Within each full-store `init` or `verify` operation, temporary-file recovery runs
+once before the complete safety inventory and content verification. Internal
+helpers reuse only that operation's preparation; later public calls still
+inspect current paths and hash all current artifact bytes. This removes nested
+recovery scans without creating a cross-call verification cache.
+
 `src/adapters` contains concrete local integrations:
 
 - `GitWorktreeAdapter` isolates Runs and Evaluations at exact commits;
@@ -82,6 +95,12 @@ server, view host and reusable graph component; FWA provides application
 queries, its pure visualization projection and workflow-specific views.
 
 ## Current visual workbench
+
+The primary interaction is one persistent requirement/DAG/node-detail surface,
+without basic/advanced navigation. Nodes own their observable outcomes, checks,
+candidate reviews and execution records. New planner output explains every
+dependency; shared write scopes and resources remain scheduler conflicts, not
+invented data dependencies. See [node-workbench.md](node-workbench.md).
 
 The current workbench extends the original CLI-first baseline with reference
 imports, structured planning, isolated Work batches and explicit plan revisions.
@@ -218,6 +237,24 @@ Evidence, and does not reset the attempt budget. Recompute clears current
 acceptance/integration pointers; its next Run resolves fresh Ref snapshots.
 Requeueing and starting an executor are separate commands.
 
+The workbench now composes those commands into a bounded ordinary-repair loop.
+It keeps immutable attempt history, feeds compact verified diagnostics and
+candidate references to the executor, and evaluates each repaired candidate
+before integration. Only confirmed ordinary execution/check failures qualify;
+no-progress, budgets, review and uncertain infrastructure stop automatic repair.
+This composition adds no persisted state machine and does not automatically
+reconcile a dead coordinator or take ownership of an unconfirmed process.
+
+For an eligible same-baseline repair, a Workbench executor decorator restores
+the verified prior candidate before invoking the producer, inside the existing
+Run lease and deadline. It binds the source to durable node history and validates
+Git objects, artifact bytes and the complete current write scope. The new Run
+HEAD/base stays unchanged, so capture and budgets include both retained work and
+the correction. A changed baseline produces an explicit restoration status and
+leaves recovery to the executor; damaged evidence or lost ownership stops it.
+Successful execution evidence records `repairRestoration`. Generic executors and
+the core Run event/state contracts do not acquire a new restoration requirement.
+
 Every Git adapter subprocess receives a sanitized `GIT_*` environment and a
 process-scoped `core.fsmonitor=false`. This prevents FWA-owned temporary
 worktrees from inheriting a machine-level filesystem-monitor daemon without
@@ -264,6 +301,41 @@ before the validated filesystem fallback completes. A later process lacks the
 captured directory identity needed to prove that an unregistered residual is
 still the same owned directory, so V0.1 leaves it for explicit operator review
 rather than guessing and recursively deleting it.
+
+`fwa run archive <run-id>` provides the explicit historical path for a failed
+Run whose worktree is still preserved. It copies the exact registered worktree
+under `.fwa/workspace-archives/runs/<run-id>`, stores a canonical manifest and
+durable archive intent, verifies source identity and bytes, then removes the
+source through the Git worktree adapter while retaining the Run branch/ref.
+The event is appended only after removal is proven. A retry may resume a
+matching archive after an append crash; a different intent, changed source,
+unexpected archive entry, link, or corrupt payload fails closed. Archive
+verification remains part of `fwa verify`, so an unreferenced or partial
+archive keeps the project operationally dirty until the event is recorded.
+
+A coordinator can also disappear after Git creates the worktree but before
+`RunStarted` is recorded. After ordinary `reconcileRun` records
+`RUN_OWNER_LOST` from `pending`, `inspectRunSetupWorkspace({runId, workspace})`
+reads the assigned path, repository ownership, Run branch and exact recorded
+base. It does not acquire a lease or mutate history.
+`recoverRunSetupWorkspace({runId, workspace, commandId,
+confirmProcessesStopped:true})` is the explicit application API for this one
+case. The operator must first confirm that the lost setup owner and descendants
+have stopped. Active operations, held leases and unresolved Git process fences
+block recovery. Two matching observations under a heartbeat lease append
+`RunWorkspaceSetupRecovered`: a registered worktree at the recorded base becomes
+`preserved`, then the existing archive API retains its bytes; complete absence
+of the directory, registration and Run ref becomes `removed` without inventing
+an archive. Partial absence, foreign repositories, links or an unexplained HEAD
+change fail closed. No cleanup occurs during inspection or recovery.
+
+Recovery stores its observation separately in `workspaceSetupRecovery`, with
+exact decimal-string device/inode identities from bigint filesystem metadata.
+Original `workspacePath`, `startedAt`, `leaseId`, failure, Node history and
+ChangeSet identity are not rewritten, and no `RunStarted` is synthesized.
+The same command is idempotent. Ordinary setup errors and already-started Runs
+cannot use this path. There is no new CLI alias; embedding callers use the
+public application API and then the existing `archiveRunWorkspace` API.
 
 ## Effects and logical Refs
 
@@ -347,8 +419,19 @@ sandbox. Git hooks, filters, helpers, child processes, filesystem access, and
 network access remain host capabilities.
 
 `CodexExecutor` uses `shell:false`, a fixed working directory, JSONL output,
-bounded capture, timeouts, abort handling, attempted process-tree termination,
-and confirmation that the managed child has closed. It
+bounded capture, abort handling, attempted process-tree termination,
+and confirmation that the managed child has closed. There is no default total
+execution timer: constructor `timeoutMs` defaults to `null`, and `0` also disables
+it. Explicit integer delays from `1` through `2147483647` milliseconds enable a
+timeout; larger delays are rejected to avoid Node's timer overflow behavior.
+Workbench supplies its own default total budgets: three minutes for planning
+and thirty minutes for execution. Trusted explicit `null` or `0` disables the
+corresponding total timer; the idle watchdog and node budget remain separate.
+Cancellation and termination-grace deadlines remain independent of this option.
+New Codex-planned leaves omit `budget.wallTimeMinutes`; existing declared budgets
+are preserved by plan revision and enforced independently by the Run orchestrator.
+Removing an existing task deadline requires an explicit authored revision;
+changing defaults does not rewrite history or update an in-flight Run. The executor
 inherits user configuration by default. `ignoreUserConfig` and the Windows-only
 `windowsSandboxOverride: "elevated"` are explicit per-Run opt-ins; the latter is
 recorded as `windows-elevated` and expands privileges, so it should be used only

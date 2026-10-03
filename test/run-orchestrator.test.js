@@ -292,7 +292,11 @@ test('partial executor failure records an invalid ChangeSet and leaves a retry-r
   assert.equal((await git(root, ['rev-parse', 'HEAD'])).stdout.trim(), baseRevision);
   assert.equal(await pathExists(path.join(root, 'undeclared.txt')), false);
   const verification = await app.verify();
-  assert.equal(verification.artifactCount, 2);
+  assert.equal(verification.artifactCount, 3);
+  const failureRef = result.run.failure.details.artifactRef;
+  assert.equal((await app.artifacts.verify(failureRef)).ok, true);
+  const failureEvidence = JSON.parse((await app.artifacts.get(failureRef)).toString('utf8'));
+  assert.deepEqual(failureEvidence.failure.details.completed, ['generated/partial.txt', 'undeclared.txt']);
   assert.equal(verification.operationallyClean, false);
   assert.deepEqual(verification.preservedWorkspaces, [result.run.id]);
 

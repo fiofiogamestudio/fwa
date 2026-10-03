@@ -1,0 +1,1342 @@
+[
+  {
+    "id": "order-receipts",
+    "request": "做一个离线订单收据包。订单 JSON 批次要校验重复订单号、客户名称、金额和币种，任何记录错误都不能覆盖旧清单；合法批次生成供别的工具使用的规范订单清单。HTML 收据阅读器只读取这个清单，保留订单顺序、正确展示各币种金额，并把客户名称当普通文本显示。另外支持归档保留天数配置，缺省 30 天，只接受 1 到 365 的整数。",
+    "background": "项目为 CommonJS/Node.js，无外部服务或 npm 依赖。所有 src 模块为待实现占位。入口 node src/orders/compile.cjs INPUT_JSON OUTPUT_JSON；记录格式 {id,customer,amountCents,currency}，id/customer 为非空字符串，amountCents 为非负安全整数，currency 仅 CNY/USD。订单清单合同 {schemaVersion:1,orders:[原记录],totalsByCurrency:{CNY:分值合计,USD:分值合计}}，原始顺序不变。错误在 stderr 输出 JSON {errors:[{row,field,code}]}，row 从1开始；初始版本至少指出一项错误并以非0退出，失败不能写目标文件。src/receipts/render.cjs 导出 renderReceipts(manifestPath)，必须实际读该JSON清单并返回HTML字符串；金额格式为 CNY 12.34 或 USD 5.07（币种代码、空格、两位小数），转义客户名称的HTML字符。src/settings/archive.cjs 导出 retentionDays(config)，设置与订单/收据没有调用或资源依赖，读取不能修改config。data/orders.json为样例输入。checks下三个真实目标检查分别覆盖批次原子性及合同、清单消费和HTML安全、配置边界，不是静态占位检查；当前应失败。按合理检查并集也提供唯一配置，允许规划选择真实成果边界；独立设置没有消费关系，不能因为同项目就串行。",
+    "projectFiles": {
+      "package.json": "{\"name\":\"fwa-planning-revision-fixture\",\"private\":true,\"type\":\"commonjs\"}\n",
+      "checks/helpers.cjs": "const fs = require('node:fs');\nconst os = require('node:os');\nconst path = require('node:path');\nconst { spawnSync } = require('node:child_process');\nconst assert = require('node:assert/strict');\nconst root = path.resolve(__dirname, '..');\nfunction workspace(t) {\n  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fwa-contract-check-'));\n  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));\n  return dir;\n}\nfunction cli(file, args) { return spawnSync(process.execPath, [path.join(root, file), ...args], { encoding:'utf8', windowsHide:true, timeout:5000 }); }\nfunction success(result) { assert.equal(result.status, 0, result.stderr); }\nmodule.exports = { fs, path, assert, workspace, cli, success };\n",
+      "data/orders.json": "[\n  {\n    \"id\": \"o1\",\n    \"customer\": \"Ada\",\n    \"amountCents\": 1234,\n    \"currency\": \"CNY\"\n  },\n  {\n    \"id\": \"o2\",\n    \"customer\": \"<script>alert(1)</script>\",\n    \"amountCents\": 507,\n    \"currency\": \"USD\"\n  }\n]\n",
+      "src/orders/compile.cjs": "throw new Error('TODO: implement atomic order manifest CLI');\n",
+      "src/receipts/render.cjs": "function renderReceipts(manifestPath) { throw new Error('TODO: consume order manifest'); }\nmodule.exports = { renderReceipts };\n",
+      "src/settings/archive.cjs": "function retentionDays(config) { throw new Error('TODO: implement archive policy'); }\nmodule.exports = { retentionDays };\n",
+      "checks/orders-contract.test.cjs": "const test=require('node:test');\nconst {fs,path,assert,workspace,cli,success}=require('./helpers.cjs');\ntest('valid batch produces ordered records and per-currency totals',t=>{\n const dir=workspace(t),input=path.join(dir,'in.json'),output=path.join(dir,'manifest.json');\n const orders=[{id:'two',customer:'Bee',amountCents:200,currency:'USD'},{id:'one',customer:'A',amountCents:125,currency:'CNY'},{id:'three',customer:'C',amountCents:50,currency:'USD'}];\n fs.writeFileSync(input,JSON.stringify(orders));success(cli('src/orders/compile.cjs',[input,output]));\n assert.deepEqual(JSON.parse(fs.readFileSync(output,'utf8')),{schemaVersion:1,orders,totalsByCurrency:{CNY:125,USD:250}});\n});\nfor(const [field,bad] of [['id',{id:'keep'}],['customer',{customer:'  '}],['amountCents',{amountCents:-1}],['currency',{currency:'EUR'}]])test('bad '+field+' leaves existing manifest byte-for-byte unchanged',t=>{\n const dir=workspace(t),input=path.join(dir,'in.json'),output=path.join(dir,'manifest.json');\n const good={id:'keep',customer:'A',amountCents:10,currency:'CNY'},second={id:'bad',customer:'B',amountCents:30,currency:'USD',...bad};\n fs.writeFileSync(input,JSON.stringify([good,second]));fs.writeFileSync(output,'previous accepted manifest');\n const result=cli('src/orders/compile.cjs',[input,output]);assert.notEqual(result.status,0);\n const errors=JSON.parse(result.stderr).errors;assert.ok(errors.some(error=>error.row===2&&error.field===field&&typeof error.code==='string'));\n assert.equal(fs.readFileSync(output,'utf8'),'previous accepted manifest');\n});\n",
+      "checks/receipt-view.test.cjs": "const test=require('node:test');\nconst {fs,path,assert,workspace}=require('./helpers.cjs');\nconst {renderReceipts}=require('../src/receipts/render.cjs');\ntest('reader follows the actual manifest order and escapes customer text',t=>{\n const dir=workspace(t),file=path.join(dir,'manifest.json');\n const orders=[{id:'z',customer:'<script>x</script>',amountCents:507,currency:'USD'},{id:'a',customer:'Alice & Bob',amountCents:1234,currency:'CNY'}];\n fs.writeFileSync(file,JSON.stringify({schemaVersion:1,orders,totalsByCurrency:{USD:507,CNY:1234}}));\n const html=renderReceipts(file);assert.match(html,/USD\\s*5\\.07/);assert.match(html,/CNY\\s*12\\.34/);\n assert.ok(!html.includes('<script>'));assert.ok(html.includes('&lt;script&gt;x&lt;/script&gt;'));assert.ok(html.includes('Alice &amp; Bob'));\n assert.ok(html.indexOf('&lt;script&gt;')<html.indexOf('Alice &amp; Bob'));\n});\n",
+      "checks/archive-policy.test.cjs": "const test=require('node:test');\nconst assert=require('node:assert/strict');\nconst {retentionDays}=require('../src/settings/archive.cjs');\ntest('archive configuration validates range and preserves its input',()=>{\n const defaults={other:'keep'};assert.equal(retentionDays(defaults),30);assert.deepEqual(defaults,{other:'keep'});\n for(const value of [1,30,365]){const config={retentionDays:value};assert.equal(retentionDays(config),value);assert.deepEqual(config,{retentionDays:value});}\n for(const value of [0,366,1.5,'30',null]){const config={retentionDays:value};assert.throws(()=>retentionDays(config));assert.deepEqual(config,{retentionDays:value});}\n});\n"
+    },
+    "validationProfiles": [
+      {
+        "schemaVersion": 1,
+        "id": "verify-orders-contract",
+        "checks": [
+          {
+            "id": "orders-contract",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/orders-contract.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-receipt-view",
+        "checks": [
+          {
+            "id": "receipt-view",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/receipt-view.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-orders-contract-and-receipt-view",
+        "checks": [
+          {
+            "id": "orders-contract",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/orders-contract.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "receipt-view",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/receipt-view.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-archive-policy",
+        "checks": [
+          {
+            "id": "archive-policy",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/archive-policy.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-orders-contract-and-archive-policy",
+        "checks": [
+          {
+            "id": "orders-contract",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/orders-contract.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "archive-policy",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/archive-policy.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-receipt-view-and-archive-policy",
+        "checks": [
+          {
+            "id": "receipt-view",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/receipt-view.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "archive-policy",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/archive-policy.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-orders-contract-and-receipt-view-and-archive-policy",
+        "checks": [
+          {
+            "id": "orders-contract",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/orders-contract.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "receipt-view",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/receipt-view.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "archive-policy",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/archive-policy.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      }
+    ],
+    "initialCheckIds": [
+      "orders-contract",
+      "receipt-view",
+      "archive-policy"
+    ],
+    "expected": {
+      "requiredOutcomes": [
+        "错误不覆盖已有订单清单",
+        "币种各自累计且订单顺序保持",
+        "收据实际消费清单并转义HTML",
+        "保留天数独立校验"
+      ],
+      "dependencies": [],
+      "independentChecks": [
+        "archive-policy"
+      ],
+      "scope": "规划质量，不声称实际功能通过",
+      "dependencyReview": "The initial producer/consumer format is fully specified and the trusted consumer check uses a self-contained file fixture. An edge is required if the authored implementation or check actually consumes the producer behavior; format compatibility alone does not force scheduling order. Human review must confirm this boundary."
+    },
+    "rounds": [
+      {
+        "id": "aggregate-errors",
+        "targetCheck": "orders-contract",
+        "feedback": "订单导入不要遇到第一项错误就停：同一批次中所有可识别的记录错误都要一次返回，每项保留行号、字段和稳定错误码；错误列表按行号再按字段名排序。同一条记录有多个错也全部列出。失败整批不写、合法清单格式和收据行为保持原要求。归档保留天数与这次补充无关。请在现有 orders-contract 行为检查中加入至少两行各含多处错误的断言。",
+        "checkIds": [
+          "orders-contract",
+          "receipt-view",
+          "archive-policy"
+        ],
+        "expected": {
+          "requiredChecks": [
+            "orders-contract",
+            "receipt-view",
+            "archive-policy"
+          ],
+          "preserveUnrelatedChecks": [
+            "archive-policy"
+          ],
+          "requiredOutcomes": [
+            "完整聚合跨记录多错误",
+            "row/field/code齐全并稳定排序",
+            "原子性和原清单合同不丢"
+          ],
+          "derivationRequired": false
+        }
+      }
+    ]
+  },
+  {
+    "id": "translation-catalog",
+    "request": "给离线工具增加翻译表导入和查询。输入 JSON 翻译记录需要检查重复的语言与键组合、空键和空文本，非法批次不能覆盖旧目录；合法批次生成规范翻译目录。查询模块从目录按语言和键取文本，请求语言缺失时回退英语，再缺失时返回键本身。另外增加语言显示名称设置，已配置名称优先，未知语言返回语言代码，不能改变翻译内容。",
+    "background": "项目使用 CommonJS/Node.js，无数据库或网络。src/i18n/import.cjs 是待实现CLI，命令 node src/i18n/import.cjs INPUT_JSON CATALOG_JSON。输入为 [{locale,key,text}]，三字段为非空字符串，(locale,key)组合唯一；目录为 {schemaVersion:1,locales:{en:{key:text},zh:{key:text}}}，保留全部合法条目，非法输入以非0退出且不覆盖已有目录。src/i18n/validate.cjs 现为内部函数占位，导出 validateTranslations(records)，合同返回 {schemaVersion:1,valid,entries,errors}：entries保留输入顺序，errors每项 {row,field,code}；合法时valid=true、errors为空，非法时valid=false。src/i18n/build-catalog.cjs 是内部函数占位，导出 buildCatalog(report)，只有valid=true且errors为空才可构建上述目录，不能绕过失败报告。src/i18n/query.cjs 导出 lookup(catalogPath,locale,key)，实际读目录，按所求语言→en→key回退。src/settings/languages.cjs 导出 displayName(labels,locale)，已配置非空显示名优先，否则返回locale，不修改labels。独立显示名设置不被导入/查询消费。初始需求的可信检查为 translation-import、catalog-query、language-labels；validate/build这两个内部模块尚不作为独立CLI交付。项目另预置了真实CLI检查脚本 validation-report 与 catalog-report-cli 供后续独立发布要求使用，初始不启用；它们的存在不代表用户已经要求这些独立CLI。后续若启用，约定命令分别为 node src/i18n/validate.cjs INPUT_JSON REPORT_JSON 和 node src/i18n/build-catalog.cjs REPORT_JSON CATALOG_JSON。初始三检查目标均应失败。检查并集配置用于允许合理成果边界。",
+    "projectFiles": {
+      "package.json": "{\"name\":\"fwa-planning-revision-fixture\",\"private\":true,\"type\":\"commonjs\"}\n",
+      "checks/helpers.cjs": "const fs = require('node:fs');\nconst os = require('node:os');\nconst path = require('node:path');\nconst { spawnSync } = require('node:child_process');\nconst assert = require('node:assert/strict');\nconst root = path.resolve(__dirname, '..');\nfunction workspace(t) {\n  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fwa-contract-check-'));\n  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));\n  return dir;\n}\nfunction cli(file, args) { return spawnSync(process.execPath, [path.join(root, file), ...args], { encoding:'utf8', windowsHide:true, timeout:5000 }); }\nfunction success(result) { assert.equal(result.status, 0, result.stderr); }\nmodule.exports = { fs, path, assert, workspace, cli, success };\n",
+      "data/translations.json": "[\n  {\n    \"locale\": \"en\",\n    \"key\": \"hello\",\n    \"text\": \"Hello\"\n  },\n  {\n    \"locale\": \"zh\",\n    \"key\": \"hello\",\n    \"text\": \"你好\"\n  }\n]\n",
+      "src/i18n/import.cjs": "throw new Error('TODO: implement atomic translation import CLI');\n",
+      "src/i18n/validate.cjs": "function validateTranslations(records) { throw new Error('TODO: validate translation records'); }\nmodule.exports = { validateTranslations };\n",
+      "src/i18n/build-catalog.cjs": "function buildCatalog(report) { throw new Error('TODO: build catalog from a valid report'); }\nmodule.exports = { buildCatalog };\n",
+      "src/i18n/query.cjs": "function lookup(catalogPath, locale, key) { throw new Error('TODO: query generated catalog'); }\nmodule.exports = { lookup };\n",
+      "src/settings/languages.cjs": "function displayName(labels, locale) { throw new Error('TODO: language display labels'); }\nmodule.exports = { displayName };\n",
+      "checks/translation-import.test.cjs": "const test=require('node:test');\nconst {fs,path,assert,workspace,cli,success}=require('./helpers.cjs');\ntest('raw translation import produces the portable catalog and remains compatible',t=>{\n const dir=workspace(t),input=path.join(dir,'input.json'),output=path.join(dir,'catalog.json');\n const entries=[{locale:'en',key:'hello',text:'Hello'},{locale:'zh',key:'hello',text:'你好'},{locale:'en',key:'bye',text:'Bye'}];\n fs.writeFileSync(input,JSON.stringify(entries));success(cli('src/i18n/import.cjs',[input,output]));\n assert.deepEqual(JSON.parse(fs.readFileSync(output,'utf8')),{schemaVersion:1,locales:{en:{hello:'Hello',bye:'Bye'},zh:{hello:'你好'}}});\n});\nfor(const entry of [{locale:'en',key:'hello',text:'Duplicate'},{locale:'zh',key:' ',text:'Hello'},{locale:'zh',key:'new',text:' '}])test('invalid import preserves old catalog: '+JSON.stringify(entry),t=>{\n const dir=workspace(t),input=path.join(dir,'input.json'),output=path.join(dir,'catalog.json');\n fs.writeFileSync(input,JSON.stringify([{locale:'en',key:'hello',text:'Hello'},entry]));fs.writeFileSync(output,'old catalog');\n assert.notEqual(cli('src/i18n/import.cjs',[input,output]).status,0);assert.equal(fs.readFileSync(output,'utf8'),'old catalog');\n});\n",
+      "checks/catalog-query.test.cjs": "const test=require('node:test');\nconst {fs,path,assert,workspace}=require('./helpers.cjs');\nconst {lookup}=require('../src/i18n/query.cjs');\ntest('query consumes supplied catalog and follows locale/en/key fallback',t=>{\n const dir=workspace(t),file=path.join(dir,'catalog.json');\n fs.writeFileSync(file,JSON.stringify({schemaVersion:1,locales:{en:{hello:'Hello',bye:'Bye'},zh:{hello:'你好'}}}));\n assert.equal(lookup(file,'zh','hello'),'你好');assert.equal(lookup(file,'zh','bye'),'Bye');assert.equal(lookup(file,'fr','hello'),'Hello');assert.equal(lookup(file,'fr','missing'),'missing');\n fs.writeFileSync(file,JSON.stringify({schemaVersion:1,locales:{en:{hello:'Changed'}}}));assert.equal(lookup(file,'en','hello'),'Changed');\n});\n",
+      "checks/language-labels.test.cjs": "const test=require('node:test');\nconst assert=require('node:assert/strict');\nconst {displayName}=require('../src/settings/languages.cjs');\ntest('configured display names win without changing labels or translations',()=>{\n const labels={en:'English',zh:'中文'};assert.equal(displayName(labels,'zh'),'中文');assert.equal(displayName(labels,'fr'),'fr');assert.deepEqual(labels,{en:'English',zh:'中文'});\n});\n",
+      "checks/validation-report.test.cjs": "const test=require('node:test');\nconst {fs,path,assert,workspace,cli,success}=require('./helpers.cjs');\ntest('standalone validation CLI emits portable valid report',t=>{\n const dir=workspace(t),input=path.join(dir,'input.json'),output=path.join(dir,'report.json'),entries=[{locale:'en',key:'x',text:'X'}];\n fs.writeFileSync(input,JSON.stringify(entries));success(cli('src/i18n/validate.cjs',[input,output]));\n assert.deepEqual(JSON.parse(fs.readFileSync(output,'utf8')),{schemaVersion:1,valid:true,entries,errors:[]});\n});\ntest('standalone report includes every invalid row and remains usable without importing a catalog',t=>{\n const dir=workspace(t),input=path.join(dir,'input.json'),output=path.join(dir,'report.json');\n const entries=[{locale:'zh',key:'',text:''},{locale:'en',key:'a',text:'A'},{locale:'en',key:'a',text:'Again'}];fs.writeFileSync(input,JSON.stringify(entries));\n const result=cli('src/i18n/validate.cjs',[input,output]);assert.notEqual(result.status,0);\n const report=JSON.parse(fs.readFileSync(output,'utf8'));assert.equal(report.valid,false);assert.deepEqual(report.entries,entries);\n for(const [row,field] of [[1,'key'],[1,'text'],[3,'key']])assert.ok(report.errors.some(error=>error.row===row&&error.field===field&&typeof error.code==='string'));\n assert.equal(fs.existsSync(path.join(dir,'catalog.json')),false);\n});\n",
+      "checks/catalog-report-cli.test.cjs": "const test=require('node:test');\nconst {fs,path,assert,workspace,cli,success}=require('./helpers.cjs');\ntest('standalone catalog builder consumes a generated report rather than the raw source',t=>{\n const dir=workspace(t),input=path.join(dir,'input.json'),report=path.join(dir,'report.json'),output=path.join(dir,'catalog.json');\n fs.writeFileSync(input,JSON.stringify([{locale:'en',key:'a',text:'A'},{locale:'zh',key:'a',text:'甲'}]));success(cli('src/i18n/validate.cjs',[input,report]));fs.unlinkSync(input);\n success(cli('src/i18n/build-catalog.cjs',[report,output]));assert.deepEqual(JSON.parse(fs.readFileSync(output,'utf8')),{schemaVersion:1,locales:{en:{a:'A'},zh:{a:'甲'}}});\n});\ntest('invalid report cannot overwrite an existing catalog',t=>{\n const dir=workspace(t),report=path.join(dir,'report.json'),output=path.join(dir,'catalog.json');\n fs.writeFileSync(report,JSON.stringify({schemaVersion:1,valid:false,entries:[],errors:[{row:1,field:'text',code:'empty'}]}));fs.writeFileSync(output,'old catalog');\n assert.notEqual(cli('src/i18n/build-catalog.cjs',[report,output]).status,0);assert.equal(fs.readFileSync(output,'utf8'),'old catalog');\n});\n"
+    },
+    "validationProfiles": [
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-catalog-query",
+        "checks": [
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import-and-catalog-query",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-language-labels",
+        "checks": [
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import-and-language-labels",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-catalog-query-and-language-labels",
+        "checks": [
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import-and-catalog-query-and-language-labels",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-validation-report",
+        "checks": [
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import-and-validation-report",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-catalog-query-and-validation-report",
+        "checks": [
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import-and-catalog-query-and-validation-report",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-language-labels-and-validation-report",
+        "checks": [
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import-and-language-labels-and-validation-report",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-catalog-query-and-language-labels-and-validation-report",
+        "checks": [
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import-and-catalog-query-and-language-labels-and-validation-report",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-catalog-report-cli",
+        "checks": [
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import-and-catalog-report-cli",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-catalog-query-and-catalog-report-cli",
+        "checks": [
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import-and-catalog-query-and-catalog-report-cli",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-language-labels-and-catalog-report-cli",
+        "checks": [
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import-and-language-labels-and-catalog-report-cli",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-catalog-query-and-language-labels-and-catalog-report-cli",
+        "checks": [
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import-and-catalog-query-and-language-labels-and-catalog-report-cli",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-validation-report-and-catalog-report-cli",
+        "checks": [
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import-and-validation-report-and-catalog-report-cli",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-catalog-query-and-validation-report-and-catalog-report-cli",
+        "checks": [
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import-and-catalog-query-and-validation-report-and-catalog-report-cli",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-language-labels-and-validation-report-and-catalog-report-cli",
+        "checks": [
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import-and-language-labels-and-validation-report-and-catalog-report-cli",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-catalog-query-and-language-labels-and-validation-report-and-catalog-report-cli",
+        "checks": [
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "verify-translation-import-and-catalog-query-and-language-labels-and-validation-report-and-catalog-report-cli",
+        "checks": [
+          {
+            "id": "translation-import",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/translation-import.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-query",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-query.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "language-labels",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/language-labels.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "validation-report",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/validation-report.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "catalog-report-cli",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/catalog-report-cli.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      }
+    ],
+    "initialCheckIds": [
+      "translation-import",
+      "catalog-query",
+      "language-labels"
+    ],
+    "expected": {
+      "requiredOutcomes": [
+        "非法批次不能覆盖旧目录",
+        "规范目录保存全部翻译",
+        "查询消费目录并按语言/英语/键回退",
+        "显示名称设置独立且不改内容"
+      ],
+      "dependencies": [],
+      "independentChecks": [
+        "language-labels"
+      ],
+      "scope": "规划质量，不声称实际功能通过",
+      "dependencyReview": "The initial producer/consumer format is fully specified and the trusted consumer check uses a self-contained file fixture. An edge is required if the authored implementation or check actually consumes the producer behavior; format compatibility alone does not force scheduling order. Human review must confirm this boundary."
+    },
+    "rounds": [
+      {
+        "id": "publish-validation-tools",
+        "targetCheck": "translation-import",
+        "feedback": "这个尚未开始的导入任务需要按可单独交付的产物拆开：校验器要独立发布，用户无需生成目录就能拿到机器可读报告；目录生成命令只消费校验报告，不能再读取原翻译表，也不能接受失败报告。校验报告与目录生成必须能分别验收。保留原始导入CLI兼容入口，内部走同一报告链，原来的全部导入/原子性验收不能丢。项目说明中已约定两个CLI路径和报告合同，对应 validation-report、catalog-report-cli 检查现已启用。查询与语言显示名功能保持原要求。",
+        "checkIds": [
+          "translation-import",
+          "catalog-query",
+          "language-labels",
+          "validation-report",
+          "catalog-report-cli"
+        ],
+        "expected": {
+          "requiredChecks": [
+            "translation-import",
+            "catalog-query",
+            "language-labels",
+            "validation-report",
+            "catalog-report-cli"
+          ],
+          "preserveUnrelatedChecks": [
+            "language-labels"
+          ],
+          "requiredOutcomes": [
+            "独立校验报告工具",
+            "只消费报告的目录命令",
+            "保留旧导入兼容入口及全部验收",
+            "旧目录消费者依赖接到实际产物"
+          ],
+          "derivationRequired": true,
+          "newDependencies": [
+            {
+              "producer": "validation-report",
+              "consumer": "catalog-report-cli"
+            },
+            {
+              "producer": "catalog-report-cli",
+              "consumer": "translation-import"
+            }
+          ]
+        }
+      },
+      {
+        "id": "stable-report-order",
+        "targetCheck": "validation-report",
+        "feedback": "仅补充校验报告的可比较性：所有错误必须按 row 数值升序、同一 row 按 field 字符串升序返回，重复运行同一输入错误列表完全一致；报告中的 entries 仍保留原始顺序，不能为了错误排序重排翻译。请把多行多字段错误顺序和重复运行一致性断言加入现有 validation-report 检查。目录格式、兼容导入、查询回退和语言显示名没有新要求。",
+        "checkIds": [
+          "translation-import",
+          "catalog-query",
+          "language-labels",
+          "validation-report",
+          "catalog-report-cli"
+        ],
+        "expected": {
+          "requiredChecks": [
+            "translation-import",
+            "catalog-query",
+            "language-labels",
+            "validation-report",
+            "catalog-report-cli"
+          ],
+          "preserveUnrelatedChecks": [
+            "language-labels"
+          ],
+          "preserveContractsChecks": [
+            "catalog-query"
+          ],
+          "requiredOutcomes": [
+            "错误列表稳定排序",
+            "entries不重排",
+            "既有派生来源继续指向历史原始任务"
+          ],
+          "derivationRequired": false,
+          "newDependencies": [
+            {
+              "producer": "validation-report",
+              "consumer": "catalog-report-cli"
+            },
+            {
+              "producer": "catalog-report-cli",
+              "consumer": "translation-import"
+            }
+          ]
+        }
+      }
+    ]
+  }
+]

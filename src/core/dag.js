@@ -18,6 +18,7 @@ const aliases = Object.freeze({
 });
 
 export const PLAN_SCHEMA_VERSION = 1;
+export const PLAN_SEMANTIC_LIMITS = Object.freeze({ textBytes: 2000, derivedChildren: 8 });
 export const PLAN_BUDGET_LIMITS = Object.freeze({
   maxRetries: 100,
   maxFiles: 100_000,
@@ -103,6 +104,45 @@ function validateStringList(value, path, errors, { nonEmpty = false } = {}) {
     validValues.push(item);
   }
   return validValues;
+}
+
+function validateSemanticText(value, path, errors) {
+  if (typeof value !== 'string' || !value.trim() || value !== value.trim()
+    || new TextEncoder().encode(value).byteLength > PLAN_SEMANTIC_LIMITS.textBytes) {
+    addError(errors, 'INVALID_SEMANTIC_TEXT', path,
+      `Expected non-empty, trimmed text of at most ${PLAN_SEMANTIC_LIMITS.textBytes} UTF-8 bytes.`);
+  }
+}
+
+function validateNodeMeaning(node, dependencies, path, errors) {
+  const hasOutcome = Object.hasOwn(node, 'outcome');
+  const hasReasons = Object.hasOwn(node, 'dependencyReasons');
+  // Historical authored plans have neither field. Never invent an explanation for them.
+  if (hasOutcome !== hasReasons) addError(errors, 'INCOMPLETE_NODE_MEANING', path,
+    'outcome and dependencyReasons must be declared together.');
+  if (hasOutcome) validateSemanticText(node.outcome, `${path}.outcome`, errors);
+  if (hasReasons) {
+    if (!Array.isArray(node.dependencyReasons)) addError(errors, 'INVALID_DEPENDENCY_REASONS', `${path}.dependencyReasons`, 'Expected an array of edge explanations.');
+    else {
+      const seen = new Set();
+      for (const [index, item] of node.dependencyReasons.entries()) {
+        const itemPath = `${path}.dependencyReasons[${index}]`;
+        if (!isPlainObject(item)) { addError(errors, 'INVALID_DEPENDENCY_REASON', itemPath, 'Expected nodeId and reason.'); continue; }
+        validateKnownFields(item, ['nodeId', 'reason'], itemPath, errors);
+        validateIdentifier(item.nodeId, `${itemPath}.nodeId`, errors);
+        validateSemanticText(item.reason, `${itemPath}.reason`, errors);
+        if (seen.has(item.nodeId) || !dependencies.includes(item.nodeId)) addError(errors, 'DEPENDENCY_REASON_MISMATCH', itemPath,
+          'Each dependency must have exactly one explanation and no unrelated explanation.');
+        seen.add(item.nodeId);
+      }
+      if (dependencies.some(id => !seen.has(id))) addError(errors, 'MISSING_DEPENDENCY_REASON', `${path}.dependencyReasons`, 'Explain every dependency.');
+    }
+  }
+  if (Object.hasOwn(node, 'derivedFrom')) {
+    validateIdentifier(node.derivedFrom, `${path}.derivedFrom`, errors);
+    if (node.derivedFrom === node.id) addError(errors, 'SELF_DERIVATION', `${path}.derivedFrom`, 'A leaf cannot derive from itself.');
+    if (!hasOutcome || !hasReasons) addError(errors, 'INCOMPLETE_NODE_MEANING', path, 'Derived leaves require an outcome and dependency explanations.');
+  }
 }
 
 function validateAcceptance(value, path, errors) {
@@ -338,6 +378,7 @@ export function validatePlan(plan, options = {}) {
 
     validateKnownFields(node, [
       'id', 'title', 'parentId', 'resources', 'instruction', 'referenceInputs',
+      'outcome', 'dependencyReasons', 'derivedFrom',
       ...aliases.dependsOn,
       'reads', 'writes',
       ...aliases.capabilities,
@@ -382,6 +423,7 @@ export function validatePlan(plan, options = {}) {
       `${path}.dependsOn`,
       errors
     );
+    validateNodeMeaning(node, validDependencies, path, errors);
     if (validId && !dependenciesById.has(node.id)) {
       dependenciesById.set(node.id, validDependencies);
     }

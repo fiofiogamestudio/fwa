@@ -27,7 +27,7 @@ async function fixture(t, allowWrite = true) {
     planner: { async plan(input) {
       planCalls++;
       return parsePlannerResponse({ title: 'HTTP test plan', questions: [], groups: [{ id: 'group', title: 'Feature', parentId: '' }], nodes: [
-        { id: 'leaf', title: 'Leaf', parentId: 'group', instruction: 'Create output.txt', dependsOn: [], reads: ['seed.txt'], writes: ['output.txt'], checks: ['output exists'], maxFiles: 1, maxDiffLines: 30 }
+        { id: 'leaf', title: 'Leaf', parentId: 'group', instruction: 'Create output.txt', outcome: 'output.txt exists', dependencyReasons: [], derivedFrom: null, resources: [], dependsOn: [], reads: ['seed.txt'], writes: ['output.txt'], checks: ['output exists'], maxFiles: 1, maxDiffLines: 30 }
       ] }, { prefix: input.prefix, referenceInputs: input.references.map(r => r.binding) });
     } }, executor: null
   } });

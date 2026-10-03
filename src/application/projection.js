@@ -1485,7 +1485,9 @@ export function projectEvents(events) {
           integrations: [...integrations.values()], reversions: [...reversions.values()] };
         if (hasActiveProjectOperation(operations)) throw new ProjectionError('Plan revision requires settled operations.', 'plan-revision-deferred', event);
         let prepared;
-        try { prepared = preparePlanRevision(goal, [...nodes.values()], payload.plan, payload.expectedRevision); }
+        // Admission enforces new prerequisite rules; replay preserves already saved plans.
+        try { prepared = preparePlanRevision(goal, [...nodes.values()], payload.plan, payload.expectedRevision,
+          { enforceDerivationPrerequisites: false }); }
         catch (error) { throw new ProjectionError(error.message, error.code ?? 'invalid-plan-revision', event); }
         if (payload.planId !== goal.planId || payload.revision !== prepared.revision
           || payload.revisionId !== `${goal.planId}:revision:${prepared.revision}`
@@ -1559,7 +1561,7 @@ export function projectEvents(events) {
           );
         }
         const nodeId = requireString(node.id, 'node.id', event);
-        if (Object.keys(node).some(key => !['id', 'title', 'parentId', 'resources', 'instruction', 'referenceInputs',
+        if (Object.keys(node).some(key => !['id', 'title', 'parentId', 'resources', 'instruction', 'referenceInputs', 'outcome', 'dependencyReasons', 'derivedFrom',
           'dependsOn', 'reads', 'writes', 'capabilities', 'acceptance', 'budget'].includes(key))) {
           throw new ProjectionError('Node definition contains unsupported fields.', 'invalid-node-definition', event);
         }
@@ -1587,7 +1589,8 @@ export function projectEvents(events) {
           const binding = revision.bindings.find(item => item.nodeId === nodeId && item.created);
           const authored = revision.plan.nodes.find(item => item.id === binding?.logicalId);
           const mapped = new Map(revision.bindings.map(item => [item.logicalId, item.nodeId]));
-          const expected = authored && { ...authored, id: nodeId, dependsOn: authored.dependsOn.map(id => mapped.get(id)) };
+          const expected = authored && { ...authored, id: nodeId, dependsOn: authored.dependsOn.map(id => mapped.get(id)),
+            ...(authored.dependencyReasons ? { dependencyReasons: authored.dependencyReasons.map(item => ({ ...item, nodeId: mapped.get(item.nodeId) })) } : {}) };
           if (!binding || stableStringify(binding) !== stableStringify(logicalDefinition)
             || stableStringify(node) !== stableStringify(expected)) {
             throw new ProjectionError('New physical Node must exactly match its revision definition.', 'node-revision-mismatch', event);
@@ -1873,6 +1876,7 @@ export function projectEvents(events) {
           ),
           workspacePath: null,
           workspaceStatus: 'not-created',
+          workspaceArchive: null,
           cleanupFailures: [],
           leaseId: null,
           changeSetId: null,
@@ -5225,6 +5229,95 @@ export function projectEvents(events) {
             event
           );
         }
+        run.workspaceStatus = 'removed';
+        run.workspaceRemovedAt = event.occurredAt;
+        run.version = streamVersion;
+        break;
+      }
+      case 'RunWorkspaceSetupRecovered': {
+        const payload = requireExactFields(event.payload, ['runId', 'confirmProcessesStopped', 'observation'], 'payload', event);
+        const runId = requireString(payload.runId, 'runId', event);
+        requireStream(event, `run:${runId}`);
+        const run = runs.get(runId);
+        if (!run || run.status !== RunStatus.FAILED || run.workspaceStatus !== 'setup-unknown'
+          || run.startedAt !== null || run.workspacePath !== null || run.changeSetId !== null
+          || run.failure?.code !== 'RUN_OWNER_LOST' || run.failure?.phase !== 'reconciliation'
+          || run.failure?.details?.previousStatus !== RunStatus.PENDING || payload.confirmProcessesStopped !== true) {
+          throw new ProjectionError('Setup recovery requires a reconciled, never-started owner-lost Run.', 'run-setup-recovery-mismatch', event);
+        }
+        const observation = requireObject(payload.observation, 'observation', event);
+        const workspacePath = requireString(observation.workspacePath, 'observation.workspacePath', event);
+        const expectedRelative = `.fwa/worktrees/${runId}`;
+        const normalizedPath = workspacePath.replaceAll('\\', '/');
+        if (!/^(?:[A-Za-z]:\/|\/)/u.test(normalizedPath) || normalizedPath.split('/').some(part => part === '.' || part === '..')
+          || run.workspaceRelativePath !== expectedRelative || !normalizedPath.endsWith(`/${expectedRelative}`)
+          || observation.runId !== runId || observation.baseRevision !== run.baseRevision
+          || observation.branch !== `fwa/runs/${runId}` || !['preserved', 'absent'].includes(observation.disposition)) {
+          throw new ProjectionError('Setup observation does not match the recorded Run identity.', 'run-setup-recovery-mismatch', event);
+        }
+        if (observation.disposition === 'preserved') {
+          const registration = requireObject(observation.registration, 'observation.registration', event);
+          const identity = requireObject(observation.identity, 'observation.identity', event);
+          if (observation.headRevision !== run.baseRevision || registration.headRevision !== run.baseRevision
+            || registration.workspacePath !== workspacePath || identity.path !== workspacePath
+            || ![identity.device, identity.inode].every(value => typeof value === 'string'
+              && value.length <= 40 && /^(?:0|[1-9][0-9]*)$/u.test(value))) {
+            throw new ProjectionError('Setup ownership does not prove the recorded base and directory.', 'run-setup-recovery-mismatch', event);
+          }
+        } else if (observation.headRevision !== null || observation.registration !== null || observation.identity !== null) {
+          throw new ProjectionError('Absent setup must prove no directory or registration.', 'run-setup-recovery-mismatch', event);
+        }
+        // This is a later observation, not RunStarted. Preserve the original
+        // null workspacePath/startedAt/leaseId and the original RunFailed event.
+        run.workspaceSetupRecovery = { ...observation, confirmProcessesStopped: true, observedAt: event.occurredAt };
+        run.workspaceStatus = observation.disposition === 'preserved' ? 'preserved' : 'removed';
+        run.version = streamVersion;
+        break;
+      }
+      case 'RunWorkspaceArchived': {
+        const runId = requireString(event.payload.runId, 'runId', event);
+        requireStream(event, `run:${runId}`);
+        const run = runs.get(runId);
+        if (!run || run.status !== RunStatus.FAILED || run.workspaceStatus !== 'preserved') {
+          throw new ProjectionError(
+            `Run ${runId} has no preserved failed workspace to archive.`,
+            'run-archive-mismatch',
+            event
+          );
+        }
+        const workspacePath = requireString(event.payload.workspacePath, 'workspacePath', event);
+        if ((run.workspacePath ?? run.workspaceSetupRecovery?.workspacePath) !== workspacePath) {
+          throw new ProjectionError(
+            `Run ${runId} archive refers to another workspace.`,
+            'run-archive-mismatch',
+            event
+          );
+        }
+        const archivePath = requireString(event.payload.archivePath, 'archivePath', event);
+        const archiveManifestDigest = requireSha256(
+          event.payload.archiveManifestDigest,
+          'archiveManifestDigest',
+          event
+        );
+        const archiveTreeDigest = requireSha256(
+          event.payload.archiveTreeDigest,
+          'archiveTreeDigest',
+          event
+        );
+        if (!Number.isSafeInteger(event.payload.archiveEntryCount)
+          || event.payload.archiveEntryCount < 0) {
+          throw new ProjectionError('archiveEntryCount must be a non-negative safe integer.', 'run-archive-mismatch', event);
+        }
+        if (run.workspaceArchive !== null) {
+          throw new ProjectionError(`Run ${runId} has already been archived.`, 'run-archive-duplicate', event);
+        }
+        run.workspaceArchive = {
+          archivePath,
+          archiveManifestDigest,
+          archiveTreeDigest,
+          archiveEntryCount: event.payload.archiveEntryCount,
+          removal: requireObject(event.payload.removal, 'removal', event)
+        };
         run.workspaceStatus = 'removed';
         run.workspaceRemovedAt = event.occurredAt;
         run.version = streamVersion;

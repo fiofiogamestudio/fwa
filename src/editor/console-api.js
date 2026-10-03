@@ -5,6 +5,8 @@ import { validateInteractionField } from '../core/interaction-contract.js';
 import { REVIEW_COMMANDS } from '../application/review-controller.js';
 import { queryExperiments } from './experiment-api.js';
 import { retryUnstartedLeaseOperation } from '../application/lease-guard-retry.js';
+import { buildWorkflow } from '../core/workflow.js';
+import { summarizeStatus } from './status-summary.js';
 
 const MAX_BODY_BYTES = 128 * 1024;
 
@@ -61,16 +63,21 @@ export async function handleConsoleApi({ app, req, res, url, sendJson }) {
         csrfToken: state.csrfToken, fweVersion: state.fweVersion, launchRevision: state.launchRevision,
         workflow: state.workbench?.capabilities(),
         review: state.review?.capabilities(), reviewCommands: state.allowWrite ? [...REVIEW_COMMANDS, 'experiment.run'] : [],
-        workflowCommands: state.allowWrite ? ['library.import', 'library.permission', 'workflow.plan', 'workflow.work', 'workflow.revise', 'node.feedback', 'plan.revise'] : [],
+        workflowCommands: state.allowWrite ? ['library.import', 'library.permission', 'workflow.plan', 'workflow.work', 'workflow.finish', 'workflow.revise', 'node.feedback', 'plan.revise'] : [],
         commands: state.allowWrite ? ['goal.create', 'plan.load', 'node.retry'] : [] });
       return true;
     }
     if (req.method === 'GET' && url.pathname === '/api/fwa/status') {
+      const view = url.searchParams.get('view');
+      if (view !== null && view !== 'summary' && view !== 'full') throw invalid('Status view must be summary or full.');
       const status = await state.application.getStatus();
       if (status.projectId !== state.projectId || status.projectRoot !== state.projectRoot) throw invalid('Project identity changed; restart the console.', 'editor-project-changed', 409);
       const fence = await new GitWorktreeAdapter(state.projectRoot).inspectProcessFence();
       const lease = await retryUnstartedLeaseOperation(state.application.lease, () => state.application.lease.inspect());
-      sendJson(200, { ...status, operational: { gitProcessFence: fence, workspaceLease: lease } });
+      const operational = { gitProcessFence: fence, workspaceLease: lease };
+      const projection = { ...status, operational,
+        workflow: buildWorkflow({ ...status, operational, nodeFeedback: status.workflow?.feedback ?? [] }) };
+      sendJson(200, view === 'summary' ? summarizeStatus(projection) : projection);
       return true;
     }
     if (req.method === 'GET' && url.pathname === '/api/fwa/events') {
@@ -161,7 +168,7 @@ export async function handleConsoleApi({ app, req, res, url, sendJson }) {
       execute = () => state.experiments.dispatch({ ...payload, commandId });
     } else if (REVIEW_COMMANDS.includes(body.type)) {
       exactFields(payload, ['changeSetId', 'reviewToken'], body.type === 'change.validate' ? ['profileId']
-        : ['change.accept', 'change.revert'].includes(body.type) ? ['note'] : []);
+        : ['change.accept', 'change.revert', 'change.finish'].includes(body.type) ? ['note'] : []);
       execute = () => state.review.dispatch(body.type, { ...payload, commandId });
     } else if (body.type === 'goal.create') {
       exactFields(payload, ['title'], ['request']);
@@ -193,6 +200,9 @@ export async function handleConsoleApi({ app, req, res, url, sendJson }) {
       field(payload.goalId, 'goalId');
       if (payload.nodeId !== undefined) field(payload.nodeId, 'nodeId');
       execute = () => state.workbench.work({ ...payload, commandId });
+    } else if (body.type === 'workflow.finish') {
+      exactFields(payload, ['changeSetId', 'reviewToken'], ['note']);
+      execute = () => state.workbench.finish({ ...payload, commandId });
     } else if (body.type === 'workflow.revise') {
       exactFields(payload, ['goalId', 'expectedRevision', 'feedbackIds']);
       execute = () => state.workbench.revise({ ...payload, commandId });

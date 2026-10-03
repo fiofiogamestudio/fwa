@@ -1,0 +1,291 @@
+[
+  {
+    "id": "todo-json-import",
+    "request": "给待办清单增加 JSON 导入。合法记录追加到当前清单；如果 JSON 无法解析、标题为空或 ID 重复，要指出具体错误，整批不得落库，原清单保持不变。",
+    "background": "这是一个 Node.js 待办数据模块，所有模块使用 CommonJS，不依赖 npm 包。src/todos/store.cjs 已提供 createStore(initial)、store.list() 和 store.addAll(items)，并复制读写数据，现有存储行为应保留。待办记录格式为 {id: 非空字符串, title: 字符串}；导入 JSON 顶层是记录数组，重复 ID 包括导入批次内部和与现有清单冲突。src/todos/import.cjs 导出同步 importTodos(text, store)，当前是待实现占位；失败通过抛出可读错误说明类型和出错记录，成功调用 store.addAll 追加整个合法批次。checks/import-behavior.test.cjs 是真实目标验收，checks/store-regression.test.cjs 是既有存储回归。当前目标验收应失败，不能把占位或静态语法检查当成完成。",
+    "projectFiles": {
+      "package.json": "{\n  \"name\": \"todo-import-fixture\",\n  \"private\": true,\n  \"type\": \"commonjs\"\n}\n",
+      "src/todos/store.cjs": "function createStore(initial = []) {\n  const records = structuredClone(initial);\n  return {\n    list() { return structuredClone(records); },\n    addAll(items) { records.push(...structuredClone(items)); }\n  };\n}\nmodule.exports = { createStore };\n",
+      "src/todos/import.cjs": "function importTodos(text, store) {\n  throw new Error('TODO: implement JSON todo import');\n}\nmodule.exports = { importTodos };\n",
+      "checks/store-regression.test.cjs": "const test = require('node:test');\nconst assert = require('node:assert/strict');\nconst { createStore } = require('../src/todos/store.cjs');\ntest('store appends records and keeps returned data detached', () => {\n  const initial = [{ id: 'old', title: 'Keep me' }];\n  const store = createStore(initial);\n  initial[0].title = 'mutated input';\n  store.addAll([{ id: 'new', title: 'Added' }]);\n  const snapshot = store.list();\n  snapshot[0].title = 'mutated output';\n  assert.deepEqual(store.list(), [{ id: 'old', title: 'Keep me' }, { id: 'new', title: 'Added' }]);\n});\n",
+      "checks/import-behavior.test.cjs": "const test = require('node:test');\nconst assert = require('node:assert/strict');\nconst { createStore } = require('../src/todos/store.cjs');\nconst { importTodos } = require('../src/todos/import.cjs');\ntest('valid import appends the whole batch without replacing old records', () => {\n  const before = [{ id: 'old', title: 'Keep me' }];\n  const added = [{ id: 'a', title: 'Read' }, { id: 'b', title: 'Walk' }];\n  const store = createStore(before);\n  importTodos(JSON.stringify(added), store);\n  assert.deepEqual(store.list(), [...before, ...added]);\n});\nfor (const [label, input, error] of [\n  ['invalid JSON', '{broken', /json|解析|语法/i],\n  ['empty title after a valid record', '[{\"id\":\"ok\",\"title\":\"Valid\"},{\"id\":\"blank\",\"title\":\"  \"}]', /title|标题/i],\n  ['duplicate ID within batch', '[{\"id\":\"dup\",\"title\":\"One\"},{\"id\":\"dup\",\"title\":\"Two\"}]', /id|标识/i],\n  ['existing ID conflict after a valid record', '[{\"id\":\"ok\",\"title\":\"Valid\"},{\"id\":\"old\",\"title\":\"Conflict\"}]', /id|标识/i]\n]) test(label + ' rejects the whole batch and identifies the error', () => {\n  const before = [{ id: 'old', title: 'Keep me' }], store = createStore(before);\n  assert.throws(() => importTodos(input, store), error);\n  assert.deepEqual(store.list(), before);\n});\n"
+    },
+    "validationProfiles": [
+      {
+        "schemaVersion": 1,
+        "id": "todo-import",
+        "checks": [
+          {
+            "id": "import-behavior",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/import-behavior.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "store-regression",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/store-regression.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      }
+    ],
+    "expected": {
+      "mustAsk": false,
+      "requiredOutcomes": [
+        "合法 JSON 整批追加并保留原清单",
+        "解析错误、空标题、批次内及现有 ID 冲突可读报错",
+        "任何错误不得部分落库",
+        "既有存储读写隔离回归仍通过"
+      ],
+      "requiredCheckIds": [
+        "import-behavior",
+        "store-regression"
+      ],
+      "dependencyReview": "这是一个端到端导入结果；实现和错误处理、测试应围绕这个结果。不得因解析、验证、写入、测试是先后步骤而默认创建跨节点依赖。",
+      "unacceptable": [
+        "独立的规划、开发、测试、验收或收尾空壳节点",
+        "只保留快乐路径来换取小图",
+        "另造检查 ID 或宣称占位模块已通过验收"
+      ],
+      "scoring": "评审完整交付的可理解程度、全部要求与可信检查映射、是否产生无实际成果的节点；不以固定节点数评分。"
+    }
+  },
+  {
+    "id": "independent-export-theme",
+    "request": "笔记增加 Markdown 导出，标题中的特殊字符要正确处理，正文保留。另外，设置模块支持 light、dark、auto 三种主题配置；缺省使用 auto，不接受其他值。两个功能都保留现有行为。",
+    "background": "这是一个 CommonJS 笔记工具，使用 Node.js 内建测试，无 npm 依赖。src/notes/export.cjs 的 exportMarkdown({title, body}) 输出一级 Markdown 标题、空行和原始正文，文件末尾一个换行；目前没有转义标题。标题按普通文字处理，checks/markdown-output.test.cjs 明确检查 *、_、[、] 的反斜杠转义和正文保留。src/settings/theme.cjs 的 readTheme(config) 返回主题字符串；当前只支持 light，需支持 light/dark/auto、字段缺失默认 auto、非法值抛出可读错误，同时不能修改传入配置。两个模块没有调用关系，没有共享可写资源，导出不读取主题，主题不消费导出文件。检查按两项能力分别提供，也提供合并检查的配置，允许计划选择真实交付边界，不受检查配置强迫拆分。",
+    "projectFiles": {
+      "package.json": "{\n  \"name\": \"notes-settings-fixture\",\n  \"private\": true,\n  \"type\": \"commonjs\"\n}\n",
+      "src/notes/export.cjs": "function exportMarkdown({ title, body }) {\n  return '# ' + title + '\\n\\n' + body + '\\n';\n}\nmodule.exports = { exportMarkdown };\n",
+      "src/settings/theme.cjs": "function readTheme(config = {}) {\n  if (config.theme === undefined || config.theme === 'light') return 'light';\n  throw new Error('Unsupported theme: ' + config.theme);\n}\nmodule.exports = { readTheme };\n",
+      "checks/markdown-output.test.cjs": "const test = require('node:test');\nconst assert = require('node:assert/strict');\nconst { exportMarkdown } = require('../src/notes/export.cjs');\ntest('plain title and body keep the existing Markdown format', () => {\n  assert.equal(exportMarkdown({ title: 'Daily note', body: 'First line\\nSecond line' }), '# Daily note\\n\\nFirst line\\nSecond line\\n');\n});\ntest('formatting characters in a title remain literal text while body is unchanged', () => {\n  assert.equal(exportMarkdown({ title: '*Plan* [draft]_v2', body: '**Keep bold**\\n- item' }), '# \\\\*Plan\\\\* \\\\[draft\\\\]\\\\_v2\\n\\n**Keep bold**\\n- item\\n');\n});\n",
+      "checks/theme-values.test.cjs": "const test = require('node:test');\nconst assert = require('node:assert/strict');\nconst { readTheme } = require('../src/settings/theme.cjs');\ntest('all supported themes are returned unchanged', () => {\n  for (const theme of ['light', 'dark', 'auto']) assert.equal(readTheme({ theme }), theme);\n});\ntest('missing theme uses auto and leaves other settings unchanged', () => {\n  const config = { fontSize: 16 };\n  assert.equal(readTheme(config), 'auto');\n  assert.deepEqual(config, { fontSize: 16 });\n});\ntest('invalid values are rejected rather than silently normalized', () => {\n  for (const theme of ['night', '', null, 12]) assert.throws(() => readTheme({ theme }), /theme|主题/i);\n});\n"
+    },
+    "validationProfiles": [
+      {
+        "schemaVersion": 1,
+        "id": "notes-export",
+        "checks": [
+          {
+            "id": "markdown-output",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/markdown-output.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "theme-settings",
+        "checks": [
+          {
+            "id": "theme-values",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/theme-values.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "notes-and-theme",
+        "checks": [
+          {
+            "id": "markdown-output",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/markdown-output.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "theme-values",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/theme-values.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      }
+    ],
+    "expected": {
+      "mustAsk": false,
+      "requiredOutcomes": [
+        "Markdown 标题特殊字符以普通文字显示，正文与既有格式保留",
+        "light/dark/auto 合法、缺省 auto、其他值拒绝、配置不被修改"
+      ],
+      "requiredCheckIds": [
+        "markdown-output",
+        "theme-values"
+      ],
+      "dependencyReview": "若两项能力形成不同节点，两者必须没有成果依赖边。不能以同项目、先基础后设置、方便执行、共享语言或先实现再测试为由串行。合在一个有完整验收的真实交付节点不自动扣分。",
+      "unacceptable": [
+        "导出依赖主题或主题依赖导出但无实际消费关系",
+        "任一功能或回归被遗漏",
+        "为测试或交付另造全局串行阶段"
+      ],
+      "scoring": "评分覆盖与边的真实性；独立需求能独立就绪是核心，不按叶数排名。"
+    }
+  },
+  {
+    "id": "atlas-index-consumer",
+    "request": "给美术工具增加可独立使用的图集索引生成器：读取素材清单，输出包含帧路径、尺寸和持续时间的规范索引。同时让预览模块读取该索引播放动画，播放顺序和每帧持续时间必须与索引一致。索引也会交给其他工具使用。",
+    "background": "这是一个 CommonJS 美术工具的无界面调度内核，Node.js 内建测试可直接运行，无 npm 依赖。已有外层绘制器按 timeline 的 path/startMs/endMs 显示帧，本次只修改索引生成和帧调度，不承诺视觉截图。assets/manifest.json 是真实输入示例，包含 frames 数组，每项有 path、width、height、durationMs。src/tools/build-atlas-index.cjs 作为独立 CLI 接收输入清单路径、输出索引路径，常用命令为 node src/tools/build-atlas-index.cjs assets/manifest.json generated/atlas-index.json。输出合同为 {schemaVersion:1,frames:[{path,width,height,durationMs}]}，保留清单顺序，创建输出目录。src/preview/timeline.cjs 导出 loadTimeline(indexPath)，必须读取该索引文件，返回 {path,width,height,startMs,endMs} 数组，首帧从 0 开始，逐帧累加 durationMs。检查实际运行生成器，并让预览消费其输出；第二套输入的帧数、路径、尺寸与时长均不同，不能硬编码样例。两项能力分别有可信检查，也提供检查并集配置以允许完整交付的合理组合。",
+    "projectFiles": {
+      "package.json": "{\n  \"name\": \"atlas-tool-fixture\",\n  \"private\": true,\n  \"type\": \"commonjs\"\n}\n",
+      "assets/manifest.json": "{\n  \"frames\": [\n    {\n      \"path\": \"idle-1.png\",\n      \"width\": 32,\n      \"height\": 48,\n      \"durationMs\": 80\n    },\n    {\n      \"path\": \"idle-2.png\",\n      \"width\": 32,\n      \"height\": 48,\n      \"durationMs\": 120\n    }\n  ]\n}\n",
+      "src/tools/build-atlas-index.cjs": "throw new Error('TODO: implement standalone atlas index generator');\n",
+      "src/preview/timeline.cjs": "function loadTimeline(indexPath) {\n  throw new Error('TODO: consume generated atlas index');\n}\nmodule.exports = { loadTimeline };\n",
+      "checks/index-contract.test.cjs": "const test = require('node:test');\nconst assert = require('node:assert/strict');\nconst fs = require('node:fs');\nconst os = require('node:os');\nconst path = require('node:path');\nconst { spawnSync } = require('node:child_process');\nconst root = path.resolve(__dirname, '..');\ntest('standalone generator writes a portable ordered index from an actual manifest', t => {\n  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-index-'));\n  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));\n  const input = path.join(root, 'assets/manifest.json'), output = path.join(dir, 'generated/atlas-index.json');\n  const result = spawnSync(process.execPath, [path.join(root, 'src/tools/build-atlas-index.cjs'), input, output], { encoding: 'utf8', windowsHide: true, timeout: 5000 });\n  assert.equal(result.status, 0, result.stderr);\n  const frames = JSON.parse(fs.readFileSync(input, 'utf8')).frames;\n  assert.deepEqual(JSON.parse(fs.readFileSync(output, 'utf8')), { schemaVersion: 1, frames });\n});\n",
+      "checks/preview-index-consumption.test.cjs": "const test = require('node:test');\nconst assert = require('node:assert/strict');\nconst fs = require('node:fs');\nconst os = require('node:os');\nconst path = require('node:path');\nconst { spawnSync } = require('node:child_process');\nconst { loadTimeline } = require('../src/preview/timeline.cjs');\nconst root = path.resolve(__dirname, '..');\ntest('preview consumes generated frame order, dimensions and per-frame timing', t => {\n  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-preview-'));\n  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));\n  for (const frames of [\n    [{ path: 'idle-1.png', width: 32, height: 48, durationMs: 80 }, { path: 'idle-2.png', width: 32, height: 48, durationMs: 120 }],\n    [{ path: 'attack-a.png', width: 64, height: 60, durationMs: 35 }, { path: 'attack-b.png', width: 65, height: 61, durationMs: 75 }, { path: 'attack-c.png', width: 66, height: 62, durationMs: 50 }]\n  ]) {\n    const input = path.join(dir, 'manifest.json'), output = path.join(dir, 'generated/atlas-index.json');\n    fs.writeFileSync(input, JSON.stringify({ frames }));\n    const result = spawnSync(process.execPath, [path.join(root, 'src/tools/build-atlas-index.cjs'), input, output], { encoding: 'utf8', windowsHide: true, timeout: 5000 });\n    assert.equal(result.status, 0, result.stderr);\n    let elapsed = 0;\n    const expected = frames.map(({ path, width, height, durationMs }) => {\n      const startMs = elapsed; elapsed += durationMs;\n      return { path, width, height, startMs, endMs: elapsed };\n    });\n    assert.deepEqual(loadTimeline(output), expected);\n  }\n});\n"
+    },
+    "validationProfiles": [
+      {
+        "schemaVersion": 1,
+        "id": "atlas-index",
+        "checks": [
+          {
+            "id": "index-contract",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/index-contract.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "atlas-preview",
+        "checks": [
+          {
+            "id": "preview-index-consumption",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/preview-index-consumption.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "id": "atlas-delivery",
+        "checks": [
+          {
+            "id": "index-contract",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/index-contract.test.cjs"
+            ],
+            "timeoutMs": 10000
+          },
+          {
+            "id": "preview-index-consumption",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/preview-index-consumption.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      }
+    ],
+    "expected": {
+      "mustAsk": false,
+      "requiredOutcomes": [
+        "可独立调用的索引生成工具，生成有版本的可消费索引",
+        "预览实际读取索引并使用帧路径、尺寸、顺序及持续时间",
+        "不同数据输入仍正确，不能硬编码"
+      ],
+      "requiredCheckIds": [
+        "index-contract",
+        "preview-index-consumption"
+      ],
+      "dependencyReview": "若生成器与预览分为两个节点，预览应依赖索引产出节点，逐边理由应写清消费索引路径及字段合同。不得倒置依赖、遗漏真正消费边或额外添加全局测试/集成边。完整单节点交付同样可接受，必须保留独立工具结果和两项检查。",
+      "unacceptable": [
+        "生成器只有内部函数、没有可独立使用的 CLI 产出",
+        "预览绕开生成索引而直接读源清单或硬编码",
+        "以共同语言或文件目录作为唯一依赖理由"
+      ],
+      "scoring": "评审实际产物/消费者与依赖理由的一致性，保留独立交付价值；不能为减少节点删去生成器合同或预览验收。"
+    }
+  },
+  {
+    "id": "missing-touch-validation",
+    "request": "修复竖屏战斗场景的拖动部署：拖动角色时不能误触底部按钮，取消拖动后按钮应恢复响应。请提供实际触控操作的录像，能看清部署、取消和按钮点击。",
+    "background": "这是一个最小 Godot 4 项目样例，project.godot 指向 src/battle/battle.tscn，场景脚本 src/battle/drag_deploy.gd 目前只有拖动状态，未处理底部按钮的输入屏蔽和恢复。src/battle/scene-metadata.json 记录竖屏尺寸和场景路径。当前仅配置 scene-config 静态元数据验证，checks/scene-metadata.test.cjs 只确认尺寸和场景/脚本路径存在，无法验证触控行为或录像。此项目没有可信的 Godot 运行、触控输入或录像采集验证 profile，未约定可用目标设备/触控模拟器与证据路径；本说明不授予这些能力。需求明确要求实际触控录像，不能用静态脚本或模拟返回成功替代。请基于现有工程信息处理缺少的验收能力。",
+    "projectFiles": {
+      "package.json": "{\n  \"name\": \"touch-validation-fixture\",\n  \"private\": true,\n  \"type\": \"commonjs\"\n}\n",
+      "project.godot": "config_version=5\n\n[application]\nconfig/name=\"Touch Deployment Fixture\"\nrun/main_scene=\"res://src/battle/battle.tscn\"\n\n[display]\nwindow/size/viewport_width=1080\nwindow/size/viewport_height=1920\n\n[rendering]\nrenderer/rendering_method=\"gl_compatibility\"\n",
+      "src/battle/scene-metadata.json": "{\n  \"orientation\": \"portrait\",\n  \"width\": 1080,\n  \"height\": 1920,\n  \"scene\": \"src/battle/battle.tscn\",\n  \"script\": \"src/battle/drag_deploy.gd\"\n}\n",
+      "src/battle/battle.tscn": "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://src/battle/drag_deploy.gd\" id=\"1\"]\n\n[node name=\"Battle\" type=\"Control\"]\nlayout_mode=3\nanchors_preset=15\nanchor_right=1.0\nanchor_bottom=1.0\ngrow_horizontal=2\ngrow_vertical=2\nscript=ExtResource(\"1\")\n\n[node name=\"DeployButton\" type=\"Button\" parent=\".\"]\noffset_left=80.0\noffset_top=1680.0\noffset_right=500.0\noffset_bottom=1840.0\ntext=\"Deploy\"\n",
+      "src/battle/drag_deploy.gd": "extends Control\n\nvar dragging := false\n\nfunc begin_drag() -> void:\n\tdragging = true\n\nfunc cancel_drag() -> void:\n\tdragging = false\n",
+      "checks/scene-metadata.test.cjs": "const test = require('node:test');\nconst assert = require('node:assert/strict');\nconst fs = require('node:fs');\nconst path = require('node:path');\nconst root = path.resolve(__dirname, '..');\ntest('scene metadata names existing portrait scene files; this is not a touch runtime check', () => {\n  const meta = JSON.parse(fs.readFileSync(path.join(root, 'src/battle/scene-metadata.json'), 'utf8'));\n  assert.equal(meta.orientation, 'portrait');\n  assert.equal(meta.width, 1080); assert.equal(meta.height, 1920);\n  assert.ok(fs.statSync(path.join(root, meta.scene)).isFile());\n  assert.ok(fs.statSync(path.join(root, meta.script)).isFile());\n});\n"
+    },
+    "validationProfiles": [
+      {
+        "schemaVersion": 1,
+        "id": "scene-config",
+        "checks": [
+          {
+            "id": "scene-metadata",
+            "kind": "test",
+            "command": "node",
+            "args": [
+              "--test",
+              "checks/scene-metadata.test.cjs"
+            ],
+            "timeoutMs": 10000
+          }
+        ]
+      }
+    ],
+    "expected": {
+      "mustAsk": true,
+      "requiredOutcomes": [
+        "拖动时按钮不误触，取消后可再次响应",
+        "可检查的实际触控录像覆盖部署、取消和按钮点击"
+      ],
+      "requiredCheckIds": [],
+      "dependencyReview": "因缺少可信运行/触控/录像验收，应提出具体可回答的能力或证据来源问题；不能用元数据检查把结果标为可验收。",
+      "unacceptable": [
+        "只用 scene-metadata 检查承担全部触控及录像验收",
+        "新造未配置的检查命令或证据 ID",
+        "把实际录像要求删去以便产出计划",
+        "把通用准备、实现、录屏等阶段当作已经可执行的承诺"
+      ],
+      "scoring": "问题应指向目标设备/模拟器、可信操作及录像检查入口和可核验证据位置；不应反复询问已明确的业务行为。此例期望 questions 模式，无执行节点。"
+    }
+  }
+]

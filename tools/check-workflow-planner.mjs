@@ -48,8 +48,8 @@ const controller = new WorkbenchController(application, { planner: new CodexPlan
 await controller.library.init();
 const library = await controller.library.importFiles({ commandId: 'synthetic-import', label: 'Synthetic requirement', files: [{ path: 'brief.md', base64: Buffer.from(
   runWork
-    ? 'Synthetic implementation requirement: create a tiny calculator module in src/calculator.js and a test in test/calculator.test.js. It must add two finite numbers and reject non-numbers, NaN and infinities. Use 2 leaf tasks in one group; the test depends on the module. During Plan only produce the plan; during Work implement only the assigned leaf. No visuals are required for this pure function.'
-    : 'This is a synthetic planning-only test. Plan a tiny console calculator module in src/calculator.js and a test in test/calculator.test.js. It must add two finite numbers and reject non-numbers. Use 2 leaf tasks in one group; the test depends on the module. Do not implement anything. No visuals are required for this pure function.'
+    ? 'Synthetic implementation requirement: create a tiny calculator module in src/calculator.js with tests in test/calculator.test.js. It must add two finite numbers and reject non-numbers, NaN and infinities. Deliver this behavior and its tests as one independently reviewable result node, without extra phase nodes. During Plan only produce the plan; during Work implement only the assigned result. No visuals are required for this pure function.'
+    : 'This is a synthetic planning-only test. Plan a tiny calculator module in src/calculator.js with tests in test/calculator.test.js. It must add two finite numbers and reject non-numbers. Keep this one independently reviewable behavior and its tests in one result node; do not add phase nodes. Do not implement anything. No visuals are required for this pure function.'
 ).toString('base64') }] });
 await controller.plan({ commandId: 'live-planner-check', request: '', libraryIds: [library.libraryId], mode: 'plan' });
 await controller.jobs.settle();

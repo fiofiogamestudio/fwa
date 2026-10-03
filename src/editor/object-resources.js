@@ -43,11 +43,12 @@ export function listObjectResources(status) {
 }
 
 export function readObjectResource(status, name) {
-  if (name === 'projection.json') return { type: 'json', data: status };
+  if (name === 'projection.json') return { type: 'json', data: summarizeStatus(status) };
   const selected = parseObjectResourceName(name);
   const rows = selected.type === 'groups' ? groupRows(status) : status[selected.type] || [];
   const object = rows.find(item => item.id === selected.id && (selected.type !== 'groups' || item.goalId === selected.goalId));
   if (!object) throw missing();
   const selection = { ...selected, ...(selected.type === 'goals' ? { goalId: object.id } : object.goalId ? { goalId: object.goalId } : {}) };
-  return { type: 'json', data: { ...status, _fwaSelection: selection } };
+  return { type: 'json', data: { ...summarizeStatus(status), _fwaSelection: selection } };
 }
+import { summarizeStatus } from './status-summary.js';

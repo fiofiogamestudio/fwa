@@ -94,6 +94,7 @@ export async function startEditor({ projectRoot, fwePath, port = 3220, allowWrit
     ? await loadReviewConfig(reviewConfig) : normalizeReviewConfig(reviewConfig);
   const workbench = new WorkbenchController(application, { ...workflow, validationProfiles: configuredReview?.validationProfiles || [] });
   const review = new ReviewController(application, { config: configuredReview, jobs: workbench.jobs, signal: workbench.abortController.signal });
+  workbench.review = review;
   const experiments = new ChangeExperiments(application, { targetRef: review.config?.targetRef,
     config: review.config?.experiment, jobs: workbench.jobs, signal: workbench.abortController.signal });
   const app = fwe.loadAppConfig(appPath);

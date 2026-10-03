@@ -2,11 +2,18 @@ import { createHash } from 'node:crypto';
 import {
   lstat,
   mkdir,
+  mkdtemp,
   realpath,
-  rm
+  rm,
+  rmdir,
+  unlink,
+  writeFile
 } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 
+import { validateActualWrites } from '../core/effects.js';
+import { stableStringify } from '../core/events.js';
 import { createGitEnvironment } from './git-environment.js';
 import {
   DEFAULT_GIT_TIMEOUT_MS,
@@ -201,6 +208,121 @@ export class GitWorktreeAdapter {
     );
 
     return this.#collectChangedFiles(workspace.workspacePath, resolvedBaseRevision);
+  }
+
+  /**
+   * Read-only ownership proof for a terminal Run workspace. Archive code uses
+   * this before copying bytes so a same-repository clone cannot be mistaken for
+   * the registered FWA worktree.
+   */
+  async inspectRunWorkspace({ workspacePath, runId } = {}) {
+    await this.gitProcessGuard.assertAvailable();
+    const normalizedRunId = validateRunId(runId);
+    const workspace = await this.#assertOwnedWorkspace({
+      runId: normalizedRunId,
+      workspacePath,
+      requireRunBranch: true
+    });
+    const registration = await this.#registeredWorktreeRecord(workspace.workspacePath);
+    if (!registration) {
+      throw new GitWorktreeError(
+        `Run ${normalizedRunId} is not currently registered as a Git worktree.`,
+        'worktree-registration-missing',
+        { details: { runId: normalizedRunId, workspacePath: workspace.workspacePath } }
+      );
+    }
+    const identity = await this.#captureRealDirectoryIdentity(workspace.workspacePath, {
+      code: 'invalid-workspace-path',
+      label: 'run workspace'
+    });
+    const headRevision = await this.#resolveCommit(workspace.workspacePath, 'HEAD');
+    if (registration.headRevision !== headRevision) {
+      throw new GitWorktreeError(
+        `Git registration HEAD differs from Run workspace HEAD ${normalizedRunId}.`,
+        'worktree-registration-head-mismatch',
+        { details: { registration, headRevision } }
+      );
+    }
+    return {
+      runId: normalizedRunId,
+      workspacePath: workspace.workspacePath,
+      branch: workspace.branch,
+      headRevision,
+      registration,
+      identity: {
+        path: identity.path,
+        device: identity.device,
+        inode: identity.inode
+      }
+    };
+  }
+
+  /** Inspect only a never-started Run's assigned setup location; never clean it. */
+  async inspectRunSetupWorkspace({ runId, baseRevision, workspaceRelativePath } = {}) {
+    await this.gitProcessGuard.assertAvailable();
+    const normalizedRunId = validateRunId(runId);
+    const expectedBase = assertObjectId(baseRevision, 'baseRevision');
+    if (workspaceRelativePath !== `.fwa/worktrees/${normalizedRunId}`) {
+      throw new GitWorktreeError('Setup recovery requires the recorded direct Run child.', 'workspace-path-outside-run');
+    }
+    const projectRoot = await this.#assertProjectRoot();
+    if (await this.#resolveCommit(projectRoot, expectedBase) !== expectedBase) {
+      throw new GitWorktreeError('Recorded setup base is not an exact commit.', 'workspace-setup-base-mismatch');
+    }
+    // Inspect each existing ancestor before absence is considered proof. lstat
+    // catches dangling links too; an absent directory under a link is not safe.
+    const workspacePath = this.#expectedWorkspacePath(normalizedRunId);
+    let missing = false;
+    for (const candidate of [this.stateDirectory, this.worktreesDirectory, workspacePath]) {
+      try {
+        const stat = await lstat(candidate);
+        if (stat.isSymbolicLink() || !stat.isDirectory()) {
+          throw new GitWorktreeError('Setup path must contain only real directories.', 'invalid-workspace-path');
+        }
+        await canonicalRealDirectory(candidate, { code: 'invalid-workspace-path', label: 'Run setup directory' });
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+        missing = true;
+        break;
+      }
+    }
+    const registration = await this.#registeredWorktreeRecord(workspacePath);
+    const branch = branchForRun(normalizedRunId);
+    const refResult = await this.#git(['show-ref', '--verify', '--hash', `refs/heads/${branch}`],
+      { cwd: projectRoot, allowedExitCodes: [0, 1, 128] });
+    // show-ref --verify may use 128 for absence; ask quiet mode to distinguish
+    // a genuinely missing ref from an unexpected Git failure.
+    if (refResult.status !== 0) {
+      const absent = await this.#git(['show-ref', '--verify', '--quiet', `refs/heads/${branch}`],
+        { cwd: projectRoot, allowedExitCodes: [0, 1] });
+      if (absent.status !== 1) throw new GitWorktreeError('Run ref changed during inspection.', 'workspace-setup-identity-changed');
+    }
+    const refRevision = refResult.status === 0 ? refResult.stdout.trim() : null;
+    if (missing) {
+      if (registration || refRevision) {
+        throw new GitWorktreeError('Missing setup directory still has Git registration or a Run ref.',
+          'workspace-setup-partial', { details: { workspacePath, registration, refRevision } });
+      }
+      return { disposition: 'absent', runId: normalizedRunId, workspacePath, baseRevision: expectedBase,
+        branch, headRevision: null, registration: null, identity: null };
+    }
+    const beforeIdentity = await lstat(workspacePath, { bigint: true });
+    const ownership = await this.inspectRunWorkspace({ runId: normalizedRunId, workspacePath });
+    const afterIdentity = await lstat(workspacePath, { bigint: true });
+    if (!beforeIdentity.isDirectory() || beforeIdentity.isSymbolicLink()
+      || !afterIdentity.isDirectory() || afterIdentity.isSymbolicLink()
+      || beforeIdentity.dev !== afterIdentity.dev || beforeIdentity.ino !== afterIdentity.ino) {
+      throw new GitWorktreeError('Setup directory changed during ownership inspection.', 'workspace-setup-identity-changed');
+    }
+    if (ownership.headRevision !== expectedBase || refRevision !== expectedBase) {
+      throw new GitWorktreeError('Never-started setup HEAD differs from its recorded base.',
+        'workspace-setup-base-mismatch', { details: { expectedBase, headRevision: ownership.headRevision, refRevision } });
+    }
+    // NTFS file IDs can exceed Number.MAX_SAFE_INTEGER. Preserve exact decimal
+    // identities in the durable observation instead of rejecting or rounding them.
+    return { ...ownership, disposition: 'preserved', baseRevision: expectedBase,
+      identity: { path: ownership.identity.path,
+        device: afterIdentity.dev.toString(), inode: afterIdentity.ino.toString() } };
   }
 
   async capture({ workspacePath, baseRevision = DEFAULT_BASE_REVISION, runId } = {}) {
@@ -836,6 +958,109 @@ export class GitWorktreeAdapter {
       changes,
       patchDigest: createHash('sha256').update(patch, 'utf8').digest('hex')
     };
+  }
+
+  /** Restore verified prior work into a fresh Run without advancing its HEAD. */
+  async restoreCandidate({ workspacePath, runId, baseRevision, changeSet, patch, writes } = {}) {
+    let phase = 'target-invalid';
+    let temporaryDirectory;
+    let patchPath;
+    try {
+      await this.gitProcessGuard.assertAvailable();
+      const normalizedRunId = validateRunId(runId);
+      const expectedBase = assertObjectId(baseRevision, 'baseRevision');
+      const assertFreshTarget = async () => {
+        const workspace = await this.inspectRunWorkspace({ workspacePath, runId: normalizedRunId });
+        if (workspace.headRevision !== expectedBase
+          || (await this.#collectChangedFiles(workspace.workspacePath, expectedBase)).length > 0) {
+          throw new GitWorktreeError(
+            'Candidate restoration requires a clean Run still at its recorded base.',
+            'repair-candidate-target-not-fresh'
+          );
+        }
+        return workspace;
+      };
+      const workspace = await assertFreshTarget();
+      phase = 'source-invalid';
+      if (changeSet?.runId === normalizedRunId) {
+        throw new GitWorktreeError('A Run cannot restore its own candidate.', 'repair-candidate-same-run');
+      }
+      const verified = await this.verifyChangeSet(changeSet);
+      if (stableStringify(verified.changes) !== stableStringify(changeSet.changes)
+        || stableStringify(verified.commits) !== stableStringify(changeSet.commits)
+        || verified.patchDigest !== changeSet.patchArtifact?.digest) {
+        throw new GitWorktreeError('Candidate records differ from verified Git evidence.',
+          'repair-candidate-source-mismatch');
+      }
+      phase = 'patch-invalid';
+      if (!(typeof patch === 'string' || Buffer.isBuffer(patch))) {
+        throw new GitWorktreeError('The candidate patch must be verified bytes.', 'repair-candidate-patch-invalid');
+      }
+      const patchBytes = Buffer.isBuffer(patch) ? Buffer.from(patch) : Buffer.from(patch, 'utf8');
+      if (createHash('sha256').update(patchBytes).digest('hex') !== verified.patchDigest) {
+        throw new GitWorktreeError('Candidate artifact differs from its Git patch.', 'repair-candidate-patch-mismatch');
+      }
+      const actualFiles = [...new Set(verified.changes.flatMap((change) => (
+        change.previousPath === undefined ? [change.path] : [change.path, change.previousPath]
+      )))].sort((left, right) => left.localeCompare(right));
+      if (!Array.isArray(changeSet.changedFiles)
+        || JSON.stringify(actualFiles) !== JSON.stringify(changeSet.changedFiles)) {
+        throw new GitWorktreeError(
+          'Candidate changedFiles differs from the complete Git change set.',
+          'repair-candidate-paths-mismatch',
+          { details: { expected: changeSet.changedFiles, actual: actualFiles } }
+        );
+      }
+      phase = 'scope-invalid';
+      const scope = validateActualWrites(writes, actualFiles, {
+        ignoreCase: await this.#readCoreIgnoreCase(workspace.workspacePath)
+      });
+      if (!scope.ok) {
+        throw new GitWorktreeError('Candidate writes exceed this Run scope.',
+          'repair-candidate-scope-violation', { details: scope });
+      }
+      const result = { changeSetId: changeSet.id, baseRevision: expectedBase,
+        candidateRevision: verified.headRevision };
+      if (verified.baseRevision !== expectedBase) {
+        return { status: 'baseline-changed', ...result, candidateBaseRevision: verified.baseRevision };
+      }
+      phase = 'target-invalid';
+      // Recheck after source/artifact inspection. git apply --index additionally
+      // requires each affected working file to match the index before writing.
+      await assertFreshTarget();
+      if (patchBytes.length === 0) return { status: 'restored', ...result };
+      temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), 'fwa-repair-'));
+      patchPath = path.join(temporaryDirectory, 'candidate.patch');
+      await writeFile(patchPath, patchBytes, { mode: 0o600, flag: 'wx' });
+      phase = 'apply-failed';
+      const applyArguments = ['apply', '--index', '--binary'];
+      await this.#git([...applyArguments, '--check', '--', patchPath], { cwd: workspace.workspacePath });
+      await assertFreshTarget();
+      await this.#git([...applyArguments, '--', patchPath], { cwd: workspace.workspacePath });
+      phase = 'restore-mismatch';
+      const restoredHead = await this.#resolveCommit(workspace.workspacePath, 'HEAD');
+      const restoredTree = singleLine(await this.#git(['write-tree'], { cwd: workspace.workspacePath }), 'write-tree');
+      const candidateTree = singleLine(await this.#git(
+        ['rev-parse', '--verify', `${verified.headRevision}^{tree}`], { cwd: workspace.workspacePath }
+      ), 'candidate tree');
+      const residual = await this.#git(['diff', '--quiet', '--exit-code', '--'], {
+        cwd: workspace.workspacePath, allowedExitCodes: [0, 1]
+      });
+      if (restoredHead !== expectedBase || restoredTree !== candidateTree || residual.status !== 0) {
+        throw new GitWorktreeError('Restored work differs from its candidate or the Run base moved.',
+          'repair-candidate-restore-mismatch');
+      }
+      return { status: 'restored', ...result };
+    } catch (error) {
+      if (error?.code?.startsWith('repair-candidate-')
+        || error?.code === 'git-process-termination-unconfirmed') throw error;
+      throw new GitWorktreeError(`Candidate restoration failed: ${error.message}`,
+        `repair-candidate-${phase}`, { cause: error, details: { causeCode: error.code ?? null } });
+    } finally {
+      // Only our two private temporary paths are removed; never clean a Run.
+      if (patchPath) await unlink(patchPath).catch(() => {});
+      if (temporaryDirectory) await rmdir(temporaryDirectory).catch(() => {});
+    }
   }
 
   async remove({ runId, workspacePath, force = false } = {}) {

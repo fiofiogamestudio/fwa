@@ -7,6 +7,7 @@ import {
 } from '../core/effects.js';
 import { createEvent, stableStringify } from '../core/events.js';
 import { assertExecutor, executorProvidesCapabilities } from '../core/executor.js';
+import { summarizeFailure } from '../core/failure-diagnostics.js';
 import { changedRefsForFiles, resolveNodeEffects } from '../core/refs.js';
 import {
   EvaluationStatus,
@@ -18,9 +19,10 @@ import {
 } from '../core/state-machines.js';
 import { hashCanonicalValue } from '../storage/file-event-store.js';
 import { findParallelConflicts, isNodeSchedulable, isUnfencedGitProcessFailure } from '../core/scheduling.js';
+import { diagnoseNodeRetry } from '../core/retry-diagnostics.js';
 import { loadProject } from './project.js';
 import { projectEvents } from './projection.js';
-import { settleLeaseOperation } from './lease-operations.js';
+import { retryUnstartedLeaseOperation, settleLeaseOperation } from './lease-operations.js';
 
 const DEFAULT_LOCK_RETRY_DELAYS = Object.freeze([5, 10, 20, 40, 80, 160, 250]);
 const DEFAULT_LEASE_TTL_MS = 30_000;
@@ -276,7 +278,67 @@ function leaseIsOwnedByRun(leaseState, runId) {
   return ownerKind === 'run' && ownerId === runId;
 }
 
-function assertAttemptBudget(node) {
+function historicalRunSnapshot(projection, run) {
+  const changeSet = projection.changeSets.find((candidate) => candidate.id === run.changeSetId) ?? null;
+  const evaluations = (projection.evaluations ?? []).filter((candidate) => candidate.runId === run.id);
+  const evidenceIds = new Set(evaluations.map((candidate) => candidate.evidenceId).filter(Boolean));
+  const evidence = (projection.evidence ?? []).filter((candidate) => evidenceIds.has(candidate.id));
+  return optionalJson({
+    schemaVersion: 1,
+    run: {
+      id: run.id,
+      nodeId: run.nodeId,
+      goalId: run.goalId,
+      status: run.status,
+      requestedBaseRevision: run.requestedBaseRevision,
+      baseRevision: run.baseRevision,
+      inputHash: run.inputHash,
+      effects: run.effects,
+      workspacePath: run.workspacePath,
+      changeSetId: run.changeSetId,
+      failure: run.failure,
+      createdAt: run.createdAt,
+      startedAt: run.startedAt,
+      failedAt: run.failedAt,
+      ...(run.workspaceSetupRecovery ? { workspaceSetupRecovery: run.workspaceSetupRecovery } : {})
+    },
+    changeSet,
+    evaluations,
+    evidence
+  });
+}
+
+function assertRecoverableRunSetup(run) {
+  if (!run || run.status !== RunStatus.FAILED || run.workspaceStatus !== 'setup-unknown'
+    || run.startedAt !== null || run.workspacePath !== null || run.changeSetId !== null
+    || run.failure?.code !== 'RUN_OWNER_LOST' || run.failure?.phase !== 'reconciliation'
+    || run.failure?.details?.previousStatus !== RunStatus.PENDING
+    || !/^[a-f0-9]{40,64}$/.test(run.baseRevision ?? '')
+    || run.workspaceRelativePath !== `.fwa/worktrees/${run.id}`) {
+    throw new RunOrchestrationError('Only reconciled owner-lost, never-started Run setup may be recovered.',
+      'run-setup-not-recoverable');
+  }
+}
+
+function archivedWorkspacePath(run) {
+  return run.workspacePath ?? run.workspaceSetupRecovery?.workspacePath;
+}
+
+function stableArchiveSourceIdentity(ownership) {
+  return {
+    path: ownership.identity.path,
+    device: ownership.identity.device,
+    inode: ownership.identity.inode,
+    branch: ownership.branch,
+    headRevision: ownership.headRevision,
+    registration: {
+      workspacePath: ownership.registration.workspacePath,
+      headRevision: ownership.registration.headRevision
+    }
+  };
+}
+
+function assertAttemptBudget(node, projection) {
   if (node.runIds.length > node.budget.maxRetries) {
     throw new RunOrchestrationError(
       `Node ${node.id} exhausted its retry budget.`,
@@ -290,9 +352,27 @@ function assertAttemptBudget(node) {
   }
 }
 
-function selectReadyNode(projection, requestedNodeId) {
+function assertRetryProgress(node, projection, input, baseRevision, executor) {
+  const diagnostic = diagnoseNodeRetry(node, projection, {
+    inputHash: 'sha256:' + hashCanonicalValue(input), baseRevision, executor
+  });
+  if (diagnostic.blocked) throw new RunOrchestrationError(diagnostic.message, diagnostic.code, diagnostic);
+}
+
+function selectReadyNode(projection, requestedNodeId, admission = undefined) {
   const hasPendingFeedback = (goalId) => (projection.nodeFeedback ?? [])
     .some((feedback) => feedback.goalId === goalId && feedback.status === 'pending');
+  const assertAdmission = candidate => {
+    assertAttemptBudget(candidate, projection);
+    if (admission) {
+      assertRetryProgress(candidate, projection, admission.input, admission.baseRevision, admission.executor);
+    } else {
+      const diagnostic = diagnoseNodeRetry(candidate, projection);
+      if (diagnostic.code === 'logical-node-retry-budget-exhausted') {
+        throw new RunOrchestrationError(diagnostic.message, diagnostic.code, diagnostic);
+      }
+    }
+  };
   let node;
   if (requestedNodeId !== undefined) {
     node = projection.nodes.find((candidate) => candidate.id === requestedNodeId);
@@ -315,7 +395,7 @@ function selectReadyNode(projection, requestedNodeId) {
       );
     }
   } else {
-    node = projection.nodes
+    const candidates = projection.nodes
       .filter((candidate) => (
         !hasPendingFeedback(candidate.goalId) && isNodeSchedulable(candidate, projection.nodes,
           projection.goals.find((goal) => goal.id === candidate.goalId))
@@ -324,15 +404,31 @@ function selectReadyNode(projection, requestedNodeId) {
         (left.readySequence ?? Number.MAX_SAFE_INTEGER)
           - (right.readySequence ?? Number.MAX_SAFE_INTEGER)
         || left.id.localeCompare(right.id)
-      ))[0];
+      ));
+    const deferred = [];
+    let deferredCount = 0;
+    const admissionCodes = new Set(['node-retry-budget-exhausted', 'logical-node-retry-budget-exhausted',
+      'retry-input-repair-required', 'retry-no-progress']);
+    for (const candidate of candidates) {
+      try {
+        assertAdmission(candidate);
+        return candidate;
+      } catch (error) {
+        if (!admissionCodes.has(error.code)) throw error;
+        deferredCount += 1;
+        if (deferred.length < 32) deferred.push({ nodeId: candidate.id, code: error.code,
+          message: error.message.slice(0, 512) });
+      }
+    }
     if (!node) {
       throw new RunOrchestrationError(
         'No valid ready node is available.',
-        'no-ready-node'
+        'no-ready-node',
+        { deferred, deferredCount, deferredTruncated: deferredCount > deferred.length }
       );
     }
   }
-  assertAttemptBudget(node);
+  assertAdmission(node);
   return node;
 }
 
@@ -495,7 +591,7 @@ function executionFailureEvidence(failure) {
     code: 'EXECUTION_FAILED',
     path: 'executor',
     message: failure.message,
-    details: { failure }
+    details: { failure: summarizeFailure(failure) }
   };
 }
 
@@ -543,7 +639,7 @@ function startHeartbeat(leasePort, acquired, ttlMs, externalSignal, deadlineMs) 
 
   const beat = () => {
     if (stopped || inFlight) return;
-    inFlight = settleLeaseOperation(leasePort, () => leasePort.heartbeat({
+    inFlight = retryUnstartedLeaseOperation(leasePort, () => leasePort.heartbeat({
       leaseId: acquired.lease.leaseId,
       ownerToken: acquired.ownerToken,
       ttlMs
@@ -578,13 +674,23 @@ function startHeartbeat(leasePort, acquired, ttlMs, externalSignal, deadlineMs) 
   };
 }
 
+function assertArchiveHeartbeatHealthy(heartbeat) {
+  if (heartbeat?.signal?.aborted) {
+    throw heartbeat.signal.reason ?? new RunOrchestrationError(
+      'Workspace lease heartbeat failed during archive.',
+      'workspace-lease-heartbeat-failed'
+    );
+  }
+}
+
 export class RunOrchestrator {
   constructor(projectRoot, {
     store,
     clock = () => new Date(),
     idFactory,
     actor = 'cli',
-    lockRetryDelays = DEFAULT_LOCK_RETRY_DELAYS
+    lockRetryDelays = DEFAULT_LOCK_RETRY_DELAYS,
+    workspaceArchives = null
   } = {}) {
     if (typeof projectRoot !== 'string' || projectRoot.trim() === '') {
       throw new TypeError('projectRoot must be a non-empty string.');
@@ -607,6 +713,7 @@ export class RunOrchestrator {
     this.idFactory = idFactory;
     this.actor = requireTrimmedString(actor, 'actor');
     this.lockRetryDelays = [...lockRetryDelays];
+    this.workspaceArchives = workspaceArchives;
   }
 
   async runNext(options = {}) {
@@ -647,6 +754,7 @@ export class RunOrchestrator {
           && currentLease.lease.ownerId === recordedId), warnings: []
       });
     }
+    for (const entry of entries) entry.executor.validateInput?.(entry.input);
     assertNoActiveProjectOperation(state.projection);
     const leaseState = await settleLeaseOperation(lease, () => lease.init());
     if (leaseState.held) throw new RunOrchestrationError('The workspace is already leased.', 'workspace-lease-held', leaseState);
@@ -685,7 +793,10 @@ export class RunOrchestrator {
           const deferred = [];
           for (const entry of sorted) {
             let node;
-            try { node = selectReadyNode(latest.projection, entry.nodeId); }
+            try {
+              node = selectReadyNode(latest.projection, entry.nodeId);
+              assertRetryProgress(node, latest.projection, entry.input, inspection.baseRevision, entry.executor);
+            }
             catch (error) { deferred.push({ nodeId: entry.nodeId, code: error.code }); continue; }
             if (!executorProvidesCapabilities(entry.executor, node.capabilities)) {
               deferred.push({ nodeId: node.id, code: 'executor-capability-mismatch' }); continue;
@@ -771,6 +882,208 @@ export class RunOrchestrator {
         })); cleanup.leaseReleased = true; }
         catch (error) { cleanup.warnings.push({ phase: 'lease-release', failure: failureFrom(error) }); }
       }
+    }
+  }
+
+  async inspectRunSetupWorkspace({ runId, workspace } = {}) {
+    assertPort(workspace, 'workspace', ['inspectRunSetupWorkspace']);
+    const normalizedRunId = requireTrimmedString(runId, 'runId');
+    const state = await this.#readState();
+    const run = state.projection.runs.find((candidate) => candidate.id === normalizedRunId);
+    assertRecoverableRunSetup(run);
+    return workspace.inspectRunSetupWorkspace({ runId: run.id,
+      baseRevision: run.baseRevision, workspaceRelativePath: run.workspaceRelativePath });
+  }
+
+  async recoverRunSetupWorkspace({ runId, commandId, lease, workspace,
+    confirmProcessesStopped = false, leaseTtlMs } = {}) {
+    assertPort(lease, 'lease', ['init', 'inspect', 'acquire', 'release']);
+    assertPort(workspace, 'workspace', ['inspectRunSetupWorkspace']);
+    const normalizedRunId = requireTrimmedString(runId, 'runId');
+    const normalizedCommandId = commandId === undefined ? this.#id('command') : requirePublicCommandId(commandId);
+    if (confirmProcessesStopped !== true) throw new RunOrchestrationError(
+      'Confirm the lost setup owner and its descendant processes have stopped before recovery.',
+      'process-stop-confirmation-required');
+    const intent = { schemaVersion: 1, type: 'RecoverRunSetupWorkspace', runId: normalizedRunId, confirmProcessesStopped: true };
+    let state = await this.#readState();
+    const existing = recordedBatch(state.store, normalizedCommandId, hashCanonicalValue(intent));
+    const result = (latest, appended) => ({ ok: true, appended, commandId: normalizedCommandId,
+      run: latest.projection.runs.find((run) => run.id === normalizedRunId) });
+    if (existing) return result(state, false);
+    assertNoActiveProjectOperation(state.projection);
+    assertRecoverableRunSetup(state.projection.runs.find((run) => run.id === normalizedRunId));
+    const leaseState = await settleLeaseOperation(lease, () => lease.init());
+    if (leaseState.held) throw new RunOrchestrationError('A workspace lease is already held.', 'workspace-lease-held');
+    const ttlMs = requireSafeDuration(leaseTtlMs, 'leaseTtlMs', DEFAULT_LEASE_TTL_MS);
+    const acquired = await settleLeaseOperation(lease, () => lease.acquire({ runId: normalizedRunId, ttlMs }));
+    const heartbeat = startHeartbeat(lease, acquired, ttlMs);
+    try {
+      const observation = await this.inspectRunSetupWorkspace({ runId: normalizedRunId, workspace });
+      // No source is removed here. Recheck under the same operation lease before
+      // recording either positive ownership or complete physical/Git absence.
+      const rechecked = await this.inspectRunSetupWorkspace({ runId: normalizedRunId, workspace });
+      if (stableStringify(observation) !== stableStringify(rechecked)) throw new RunOrchestrationError(
+        'Run setup identity changed during recovery.', 'workspace-setup-identity-changed');
+      assertArchiveHeartbeatHealthy(heartbeat);
+      await this.#appendDerived({ commandId: normalizedCommandId, correlationId: normalizedCommandId, intent,
+        build: (latest) => {
+          assertNoActiveProjectOperation(latest.projection);
+          const run = latest.projection.runs.find((candidate) => candidate.id === normalizedRunId);
+          assertRecoverableRunSetup(run);
+          return [{ type: 'RunWorkspaceSetupRecovered', streamId: `run:${normalizedRunId}`,
+            payload: { runId: normalizedRunId, confirmProcessesStopped: true, observation: optionalJson(observation) } }];
+        } });
+      return result(await this.#readState(), true);
+    } finally {
+      try { await heartbeat.stop(); }
+      finally { await settleLeaseOperation(lease, () => lease.release({ leaseId: acquired.lease.leaseId, ownerToken: acquired.ownerToken })); }
+    }
+  }
+
+  async archiveRunWorkspace({ runId, commandId, lease, workspace, workspaceArchives, leaseTtlMs } = {}) {
+    assertPort(lease, 'lease', ['init', 'inspect', 'acquire', 'release', 'archiveStale']);
+    assertPort(workspace, 'workspace', ['inspectRunWorkspace', 'remove']);
+    const archiveStore = workspaceArchives ?? this.workspaceArchives;
+    assertPort(archiveStore, 'workspaceArchives', ['create', 'verifyRun']);
+    const normalizedRunId = requireTrimmedString(runId, 'runId');
+    const normalizedCommandId = commandId === undefined
+      ? this.#id('command')
+      : requirePublicCommandId(commandId);
+    const ttlMs = requireSafeDuration(leaseTtlMs, 'leaseTtlMs', DEFAULT_LEASE_TTL_MS);
+    const intent = { schemaVersion: 1, type: 'ArchiveRunWorkspace', runId: normalizedRunId };
+    let state = await this.#readState();
+    const intentHash = hashCanonicalValue(intent);
+    const existing = recordedBatch(state.store, normalizedCommandId, intentHash);
+    if (existing) return this.#archiveResult(state, normalizedCommandId, normalizedRunId, false);
+    assertNoActiveProjectOperation(state.projection);
+    const run = state.projection.runs.find((candidate) => candidate.id === normalizedRunId);
+    if (!run) throw new RunOrchestrationError(`Run ${normalizedRunId} does not exist.`, 'run-not-found');
+    if (run.status !== RunStatus.FAILED || run.workspaceStatus !== 'preserved') {
+      throw new RunOrchestrationError(
+        `Run ${normalizedRunId} must be a failed Run with a preserved workspace.`,
+        'run-workspace-not-archivable',
+        { runId: normalizedRunId, status: run.status, workspaceStatus: run.workspaceStatus }
+      );
+    }
+    const leaseState = await settleLeaseOperation(lease, () => lease.init());
+    if (leaseState.held) {
+      throw new RunOrchestrationError('A workspace lease is already held.', 'workspace-lease-held', { lease: leaseState });
+    }
+    const acquired = await settleLeaseOperation(lease, () => lease.acquire({ runId: normalizedRunId, ttlMs }));
+    let leaseReleased = false;
+    let heartbeat = null;
+    let heartbeatFailure = null;
+    try {
+      heartbeat = startHeartbeat(lease, acquired, ttlMs);
+      state = await this.#readState();
+      const current = state.projection.runs.find((candidate) => candidate.id === normalizedRunId);
+      if (!current || current.status !== RunStatus.FAILED || current.workspaceStatus !== 'preserved') {
+        throw new RunOrchestrationError('Run changed before workspace archival.', 'run-workspace-not-archivable');
+      }
+      const history = historicalRunSnapshot(state.projection, current);
+      const workspacePath = archivedWorkspacePath(current);
+      let existingArchive = null;
+      try {
+        existingArchive = await archiveStore.verifyRun({ runId: normalizedRunId });
+        if (stableStringify(existingArchive.manifest.history) !== stableStringify(history)) {
+          throw new RunOrchestrationError('Existing workspace archive history differs from the Run.', 'workspace-archive-history-mismatch');
+        }
+      } catch (error) {
+        if (error?.code !== 'workspace-archive-manifest-missing') throw error;
+      }
+      let ownership;
+      try {
+        ownership = await workspace.inspectRunWorkspace({
+          runId: normalizedRunId,
+          workspacePath
+        });
+      } catch (error) {
+        const sourceMissing = error?.code === 'invalid-workspace-path'
+          && error?.cause?.code === 'ENOENT';
+        if (!existingArchive || !sourceMissing) throw error;
+        ownership = { identity: existingArchive.manifest.source.identity };
+      }
+      const archiveIdentity = ownership.registration
+        ? stableArchiveSourceIdentity(ownership)
+        : ownership.identity;
+      const archive = await archiveStore.create({
+        runId: normalizedRunId,
+        workspacePath,
+        sourceIdentity: archiveIdentity,
+        history
+      });
+      assertArchiveHeartbeatHealthy(heartbeat);
+      if (!existingArchive) {
+        const beforeRemoval = await workspace.inspectRunWorkspace({
+          runId: normalizedRunId,
+          workspacePath
+        });
+        if (stableStringify(stableArchiveSourceIdentity(beforeRemoval))
+          !== stableStringify(archiveIdentity)) {
+          throw new RunOrchestrationError(
+            'Run workspace Git identity changed after archive capture.',
+            'workspace-changed-after-archive',
+          { runId: normalizedRunId }
+          );
+        }
+      }
+      assertArchiveHeartbeatHealthy(heartbeat);
+      const removal = await workspace.remove({
+        runId: normalizedRunId,
+        workspacePath,
+        force: true
+      });
+      if (removal?.removed !== true && removal?.alreadyAbsent !== true) {
+        throw new RunOrchestrationError('Workspace adapter did not prove source removal.', 'workspace-removal-unproven', { removal });
+      }
+      assertArchiveHeartbeatHealthy(heartbeat);
+      await this.#appendDerived({
+        commandId: normalizedCommandId,
+        correlationId: normalizedCommandId,
+        intent,
+        build: (latest) => {
+          const latestRun = latest.projection.runs.find((candidate) => candidate.id === normalizedRunId);
+          if (!latestRun || latestRun.status !== RunStatus.FAILED
+            || latestRun.workspaceStatus !== 'preserved'
+            || archivedWorkspacePath(latestRun) !== workspacePath) {
+            throw new RunOrchestrationError('Run changed before archive event append.', 'run-workspace-not-archivable');
+          }
+          return [{
+            type: 'RunWorkspaceArchived',
+            streamId: `run:${normalizedRunId}`,
+            payload: {
+              runId: normalizedRunId,
+              workspacePath,
+              archivePath: archive.archivePath,
+              archiveManifestDigest: `sha256:${archive.manifestDigest}`,
+              archiveTreeDigest: `sha256:${archive.treeDigest}`,
+              archiveEntryCount: archive.entries.length,
+              removal: optionalJson(removal)
+            }
+          }];
+        }
+      });
+      return this.#archiveResult(await this.#readState(), normalizedCommandId, normalizedRunId, true);
+    } finally {
+      if (heartbeat) {
+        try { await heartbeat.stop(); }
+        catch (error) { heartbeatFailure = error; }
+        heartbeat = null;
+      }
+      try {
+        await settleLeaseOperation(lease, () => lease.release({
+          leaseId: acquired.lease.leaseId,
+          ownerToken: acquired.ownerToken
+        }));
+        leaseReleased = true;
+      } catch (error) {
+        // A successful archive must never hide an uncertain lease release.
+        // Existing command replay remains available, but the caller must see
+        // the operational failure and verify before proceeding.
+        throw error;
+      }
+      if (heartbeatFailure) throw heartbeatFailure;
+      void leaseReleased;
     }
   }
 
@@ -907,24 +1220,12 @@ export class RunOrchestrator {
       const runId = eventFromBatch(existing, 'RunCreated').payload.runId;
       return await this.#existingRunResult(state, normalizedCommandId, runId, lease);
     }
+    // Bad input is a configuration error; do not create a Run or workspace.
+    executor.validateInput?.(normalizedInput);
     if (!batchContext) assertNoActiveProjectOperation(state.projection);
-    const selectedNode = batchContext
+    let selectedNode = batchContext
       ? state.projection.nodes.find((node) => node.id === requestedNodeId)
-      : selectReadyNode(state.projection, requestedNodeId);
-    const selectedEffects = resolveNodeEffects(
-      selectedNode,
-      refContracts(state.projection)
-    );
-    if (!executorProvidesCapabilities(executor, selectedNode.capabilities)) {
-      throw new RunOrchestrationError(
-        `Executor ${executor.id} does not provide every capability required by ${selectedNode.id}.`,
-        'executor-capability-mismatch',
-        {
-          required: selectedNode.capabilities,
-          provided: [...executor.capabilities]
-        }
-      );
-    }
+      : requestedNodeId === undefined ? null : selectReadyNode(state.projection, requestedNodeId);
 
     const leaseState = batchContext ? null : await settleLeaseOperation(lease, () => lease.init());
     if (!batchContext) await artifacts.init();
@@ -944,6 +1245,16 @@ export class RunOrchestrator {
       throw new RunOrchestrationError(
         'The workspace adapter returned an invalid inspection.',
         'invalid-workspace-result'
+      );
+    }
+    const admission = { input: normalizedInput, baseRevision: inspection.baseRevision, executor };
+    if (!batchContext) selectedNode = selectReadyNode(state.projection, requestedNodeId, admission);
+    const selectedEffects = resolveNodeEffects(selectedNode, refContracts(state.projection));
+    if (!executorProvidesCapabilities(executor, selectedNode.capabilities)) {
+      throw new RunOrchestrationError(
+        `Executor ${executor.id} does not provide every capability required by ${selectedNode.id}.`,
+        'executor-capability-mismatch',
+        { required: selectedNode.capabilities, provided: [...executor.capabilities] }
       );
     }
     normalizeWritePatterns(selectedEffects.writes, {
@@ -997,7 +1308,7 @@ export class RunOrchestrator {
           return { ...replay, cleanup };
         }
         assertNoActiveProjectOperation(fencedState.projection);
-        const fencedNode = selectReadyNode(fencedState.projection, selectedNode.id);
+        const fencedNode = selectReadyNode(fencedState.projection, selectedNode.id, admission);
         const fencedEffects = resolveNodeEffects(
           fencedNode,
           refContracts(fencedState.projection)
@@ -1030,7 +1341,7 @@ export class RunOrchestrator {
           intent: overallIntent,
           build: (latest) => {
             assertNoActiveProjectOperation(latest.projection);
-            const currentNode = selectReadyNode(latest.projection, fencedNode.id);
+            const currentNode = selectReadyNode(latest.projection, fencedNode.id, admission);
             const currentEffects = resolveNodeEffects(
               currentNode,
               refContracts(latest.projection)
@@ -1230,6 +1541,34 @@ export class RunOrchestrator {
       }
       heartbeat = null;
 
+      if (executionFailure) {
+        // Persist complete executor diagnostics once, before capture (which can
+        // itself fail). Events and retry inputs only carry a bounded summary and
+        // this immutable reference, never recursively embedded stdout/stderr.
+        try {
+          const failureArtifact = await artifacts.put(`${stableStringify({
+            schemaVersion: 1, runId: persistedRunId,
+            executor: { id: executor.id, version: executor.version },
+            failure: executionFailure
+          })}\n`);
+          await artifacts.verify(failureArtifact);
+          executionFailure = summarizeFailure(executionFailure, { artifactRef: failureArtifact });
+        } catch (error) {
+          if (batchContext && terminationUnconfirmed(executionFailure)) batchContext.markUnsafe(executionFailure);
+          const retained = summarizeFailure(executionFailure);
+          await this.#recordRunningFailure({
+            runId: persistedRunId,
+            commandId: this.#internalCommand(persistedRunId, 'failure-artifact-failed'),
+            correlationId: normalizedCommandId,
+            phase: 'artifact',
+            failure: { ...retained, details: { ...retained.details,
+              retentionFailure: summarizeFailure(failureFrom(error, 'ARTIFACT_WRITE_FAILED')) } }
+          });
+          cleanup.preservedWorkspace = workspaceInfo.workspacePath;
+          return await this.#runResult(normalizedCommandId, persistedRunId, true, cleanup);
+        }
+      }
+
       if (batchContext && terminationUnconfirmed(executionFailure)) {
         batchContext.markUnsafe(executionFailure);
         await this.#recordRunningFailure({
@@ -1259,12 +1598,16 @@ export class RunOrchestrator {
           }
         );
       } catch (error) {
+        const captureFailure = failureFrom(error, 'CHANGESET_CAPTURE_FAILED');
+        if (executionFailure) captureFailure.details = {
+          ...(captureFailure.details ?? {}), executionFailure
+        };
         await this.#recordRunningFailure({
           runId: persistedRunId,
           commandId: this.#internalCommand(persistedRunId, 'capture-failed'),
           correlationId: normalizedCommandId,
           phase: 'capture',
-          failure: failureFrom(error, 'CHANGESET_CAPTURE_FAILED')
+          failure: captureFailure
         });
         terminalResult = await this.#runResult(normalizedCommandId, persistedRunId, true, cleanup);
         return terminalResult;
@@ -1961,6 +2304,17 @@ export class RunOrchestrator {
       run,
       changeSet,
       cleanup
+    };
+  }
+
+  #archiveResult(state, commandId, runId, appended) {
+    const run = state.projection.runs.find((candidate) => candidate.id === runId);
+    return {
+      ok: run?.workspaceStatus === 'removed',
+      appended,
+      commandId,
+      run,
+      archive: run?.workspaceArchive ?? null
     };
   }
 

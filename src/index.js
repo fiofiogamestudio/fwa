@@ -62,3 +62,7 @@ export * from './core/invalidation.js';
 export * from './core/refs.js';
 export { ArtifactStore, ArtifactStoreError } from './storage/artifact-store.js';
 export { WorkspaceLease, WorkspaceLeaseError } from './storage/workspace-lease.js';
+export {
+  WorkspaceArchiveStore,
+  WorkspaceArchiveError
+} from './storage/workspace-archive.js';

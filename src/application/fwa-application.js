@@ -9,10 +9,13 @@ import {
 } from '../core/dag.js';
 import { createEvent, stableStringify } from '../core/events.js';
 import { validateEvidenceAgainstProfile } from '../core/evaluator.js';
+import { summarizeFailure } from '../core/failure-diagnostics.js';
 import { isRefId, normalizeRef } from '../core/refs.js';
 import { GoalStatus } from '../core/state-machines.js';
 import { INTERACTION_FIELDS } from '../core/interaction-contract.js';
-import { buildWorkflow, preparePlanRevision } from '../core/workflow.js';
+import { buildWorkflow, currentLogicalPlan, preparePlanRevision } from '../core/workflow.js';
+import { buildRetryDiagnostics, diagnoseNodeRetry } from '../core/retry-diagnostics.js';
+import { diagnosePlan } from '../core/plan-diagnostics.js';
 import { hasActiveProjectOperation, nodeHasUnsettledWorkspace, nodeRetryEligibility } from '../core/scheduling.js';
 import {
   FileEventStore,
@@ -20,6 +23,8 @@ import {
 } from '../storage/file-event-store.js';
 import { ArtifactStore } from '../storage/artifact-store.js';
 import { WorkspaceLease } from '../storage/workspace-lease.js';
+import { WorkspaceArchiveStore } from '../storage/workspace-archive.js';
+import { WorkbenchJobs } from '../storage/workbench-jobs.js';
 import {
   initializeProject,
   loadProject,
@@ -178,7 +183,7 @@ function canonicalNode(node, index) {
   }
   const path = `nodes[${index}]`;
   rejectUnknownFields(node, [
-    'id', 'title', 'parentId', 'resources', 'instruction', 'referenceInputs',
+    'id', 'title', 'parentId', 'resources', 'instruction', 'referenceInputs', 'outcome', 'dependencyReasons', 'derivedFrom',
     'dependsOn', 'depends_on',
     'reads', 'writes',
     'capabilities', 'requires',
@@ -209,7 +214,7 @@ function canonicalNode(node, index) {
     budget: canonicalBudget(node.budget, `${path}.budget`)
   };
   if (Object.hasOwn(node, 'title')) result.title = node.title;
-  for (const field of ['parentId', 'resources', 'instruction', 'referenceInputs']) {
+  for (const field of ['parentId', 'resources', 'instruction', 'referenceInputs', 'outcome', 'dependencyReasons', 'derivedFrom']) {
     if (Object.hasOwn(node, field)) result[field] = cloneJson(node[field], `${path}.${field}`);
   }
   return result;
@@ -297,12 +302,15 @@ export class FwaApplication {
     this.lease = options.lease ?? new WorkspaceLease(this.projectRoot, {
       clock: this.clock
     });
+    this.workspaceArchives = options.workspaceArchives
+      ?? new WorkspaceArchiveStore(this.projectRoot, { clock: this.clock });
     this.runOrchestrator = new RunOrchestrator(this.projectRoot, {
       store: this.store,
       clock: this.clock,
       idFactory: this.idFactory,
       actor: this.actor,
-      lockRetryDelays: this.lockRetryDelays
+      lockRetryDelays: this.lockRetryDelays,
+      workspaceArchives: this.workspaceArchives
     });
     this.evaluationOrchestrator = new EvaluationOrchestrator(this.projectRoot, {
       store: this.store,
@@ -324,12 +332,14 @@ export class FwaApplication {
     const project = initializeProject(this.projectRoot, this.clock());
     const storage = await this.store.init();
     const artifacts = await this.artifacts.init();
+    const workspaceArchives = await this.workspaceArchives.init();
     const lease = await this.#leaseOperation(() => this.lease.init());
     return {
       initialized: project.initialized,
       project: project.config,
       storage,
       artifacts,
+      workspaceArchives,
       lease
     };
   }
@@ -726,6 +736,18 @@ export class FwaApplication {
 
   async getStatus() {
     const state = await this.#readState();
+    const retryDiagnostics = buildRetryDiagnostics(state.projection);
+    this.planDiagnosticsCache ??= new Map();
+    const planDiagnostics = state.projection.goals.filter(goal => goal.planId != null).map(goal => {
+      const plan = currentLogicalPlan(goal, state.projection.nodes);
+      const fingerprint = hashCanonicalValue(plan);
+      let cached = this.planDiagnosticsCache.get(goal.id);
+      if (cached?.fingerprint !== fingerprint) {
+        cached = { fingerprint, result: { goalId: goal.id, ...diagnosePlan(plan) } };
+        this.planDiagnosticsCache.set(goal.id, cached);
+      }
+      return structuredClone(cached.result);
+    });
     return {
       projectId: state.project.projectId,
       projectRoot: state.project.projectRoot,
@@ -743,7 +765,9 @@ export class FwaApplication {
       reversions: state.projection.reversions ?? [],
       projectRevisions: state.projection.projectRevisions ?? [],
       runBatches: state.projection.runBatches ?? [],
-      workflow: buildWorkflow(state.projection)
+      retryDiagnostics,
+      planDiagnostics,
+      workflow: buildWorkflow({ ...state.projection, retryDiagnostics })
     };
   }
 
@@ -761,6 +785,23 @@ export class FwaApplication {
 
   async reconcileRunBatch(options = {}) {
     return this.runOrchestrator.reconcileBatch({ lease: this.lease, ...options });
+  }
+
+  async archiveRunWorkspace(options = {}) {
+    return this.runOrchestrator.archiveRunWorkspace({
+      lease: this.lease,
+      workspace: options.workspace,
+      ...options,
+      workspaceArchives: this.workspaceArchives
+    });
+  }
+
+  async inspectRunSetupWorkspace(options = {}) {
+    return this.runOrchestrator.inspectRunSetupWorkspace(options);
+  }
+
+  async recoverRunSetupWorkspace(options = {}) {
+    return this.runOrchestrator.recoverRunSetupWorkspace({ lease: this.lease, ...options });
   }
 
   async retryNode({ nodeId, commandId, reason } = {}) {
@@ -805,6 +846,12 @@ export class FwaApplication {
         if (nodeHasUnsettledWorkspace(node, state.projection)) {
           throw new FwaApplicationError('Reconcile node workspaces before retrying.',
             'node-workspace-not-settled');
+        }
+        // Do not enqueue a retry that the Run admission gate will immediately
+        // reject. Historical retry events remain valid and readable.
+        const diagnostic = diagnoseNodeRetry(node, state.projection);
+        if (['pending-node-feedback', 'logical-node-retry-budget-exhausted'].includes(diagnostic.code)) {
+          throw new FwaApplicationError(diagnostic.message, diagnostic.code, diagnostic);
         }
         const event = this.#event({
           type: 'NodeRetryRequested', streamId: `node:${node.id}`,
@@ -995,6 +1042,31 @@ export class FwaApplication {
         'candidateWorkspace must provide inspectResidue when supplied.',
         'invalid-verification-port'
       );
+    }
+    // Failed execution can be retained before capture, so it may have no
+    // ChangeSet at all. Follow only the two authored Run failure edges; do not
+    // treat arbitrary hashes found in diagnostic output as artifact references.
+    for (const run of state.projection.runs) {
+      for (const failure of [run.failure, run.failure?.details?.executionFailure]) {
+        const ref = failure?.details?.artifactRef;
+        if (ref === undefined || ref === null) continue;
+        const bytes = await this.artifacts.get(ref);
+        // Run diagnostics are canonical JSON with one optional trailing LF,
+        // matching the execution evidence writer rather than profile artifacts.
+        const canonicalBytes = bytes.at(-1) === 10 ? bytes.subarray(0, -1) : bytes;
+        const envelope = parseCanonicalJsonArtifact(canonicalBytes,
+          `Run ${run.id} failure artifact`, { runId: run.id });
+        const recordedSummary = { code: failure.code, message: failure.message, details: failure.details };
+        if (!requireExactObjectFields(envelope, ['schemaVersion', 'runId', 'executor', 'failure'])
+          || envelope.schemaVersion !== 1 || envelope.runId !== run.id
+          || stableStringify(envelope.executor) !== stableStringify(run.executor)
+          || !isPlainObject(envelope.failure)
+          || stableStringify(summarizeFailure(envelope.failure, { artifactRef: ref })) !== stableStringify(recordedSummary)) {
+          throw new FwaApplicationError(`Run ${run.id} failure artifact does not match its durable failure.`,
+            'failure-artifact-binding-mismatch', { runId: run.id, artifactDigest: ref.digest });
+        }
+        referencedArtifactDigests.add(ref.digest);
+      }
     }
     for (const changeSet of state.projection.changeSets) {
       await this.artifacts.verify(changeSet.patchArtifact);
@@ -1431,7 +1503,37 @@ export class FwaApplication {
         gitVerifiedReversionCount += 1;
       }
     }
+    // A succeeded job publishes its artifact first. Snapshot owners before the
+    // inventory, but defer job errors so existing artifact corruption wins.
+    const planningJobs = await new WorkbenchJobs(this.projectRoot).list()
+      .then(value => ({ value }), error => ({ error }));
     const storedArtifactRefs = await this.artifacts.listRefs();
+    if (Object.hasOwn(planningJobs, 'error')) throw planningJobs.error;
+    // Planning provenance is owned by durable workbench jobs, not by a Run.
+    // Inspect only their authored evidence edge after the existing event/artifact
+    // checks; arbitrary hashes and business claims in job results confer nothing.
+    for (const job of planningJobs.value) {
+      if (job.state !== 'succeeded' || !['workflow.plan', 'workflow.revise'].includes(job.type)) continue;
+      const ref = job.result?.evidence;
+      const bytes = await this.artifacts.get(ref);
+      const details = { commandId: job.commandId, artifactDigest: ref.digest };
+      let envelope;
+      try {
+        const source = bytes.toString('utf8');
+        if (!Buffer.from(source, 'utf8').equals(bytes)) throw new TypeError('bytes are not valid UTF-8');
+        envelope = JSON.parse(source);
+      } catch {
+        throw new FwaApplicationError(`Planning evidence for ${job.commandId} is not valid UTF-8 JSON.`,
+          'planning-evidence-artifact-invalid', details);
+      }
+      if (!isPlainObject(envelope) || envelope.schemaVersion !== 1 || envelope.kind !== 'planning-evidence'
+        || !isPlainObject(envelope.planner)
+        || (Object.hasOwn(envelope, 'projectSnapshot') && !isPlainObject(envelope.projectSnapshot))) {
+        throw new FwaApplicationError(`Planning evidence for ${job.commandId} has an invalid envelope.`,
+          'planning-evidence-artifact-invalid', details);
+      }
+      referencedArtifactDigests.add(ref.digest);
+    }
     const artifactBytes = storedArtifactRefs.reduce(
       (total, artifact) => total + artifact.size,
       0
@@ -1453,6 +1555,44 @@ export class FwaApplication {
     const unknownWorkspaces = state.projection.runs
       .filter((run) => run.workspaceStatus === 'setup-unknown')
       .map((run) => run.id);
+    const workspaceArchiveErrors = [];
+    let workspaceArchives = [];
+    try {
+      workspaceArchives = await this.workspaceArchives.inspectAll();
+    } catch (error) {
+      workspaceArchiveErrors.push({
+        code: error?.code ?? 'workspace-archive-invalid',
+        message: error?.message ?? String(error),
+        details: error?.details ?? null
+      });
+    }
+    const archivedRunIds = new Set();
+    for (const run of state.projection.runs) {
+      if (run.workspaceArchive === null) continue;
+      archivedRunIds.add(run.id);
+      try {
+        const archive = await this.workspaceArchives.verifyRun({ runId: run.id });
+        if (archive.archivePath !== run.workspaceArchive.archivePath
+          || `sha256:${archive.manifestDigest}` !== run.workspaceArchive.archiveManifestDigest
+          || `sha256:${archive.treeDigest}` !== run.workspaceArchive.archiveTreeDigest
+          || archive.entries.length !== run.workspaceArchive.archiveEntryCount) {
+          throw new FwaApplicationError(
+            `Run ${run.id} workspace archive binding does not match its event.`,
+            'workspace-archive-binding-mismatch'
+          );
+        }
+      } catch (error) {
+        workspaceArchiveErrors.push({
+          runId: run.id,
+          code: error?.code ?? 'workspace-archive-invalid',
+          message: error?.message ?? String(error),
+          details: error?.details ?? null
+        });
+      }
+    }
+    const unreferencedWorkspaceArchives = workspaceArchives
+      .filter((archive) => !archivedRunIds.has(archive.manifest.runId))
+      .map((archive) => archive.manifest.runId);
     const activeEvaluations = (state.projection.evaluations ?? [])
       .filter((evaluation) => ['requested', 'running'].includes(evaluation.status))
       .map((evaluation) => evaluation.id);
@@ -1637,6 +1777,8 @@ export class FwaApplication {
         && pendingWorkspaceCleanup.length === 0
         && preservedWorkspaces.length === 0
         && unknownWorkspaces.length === 0
+        && workspaceArchiveErrors.length === 0
+        && unreferencedWorkspaceArchives.length === 0
         && activeEvaluations.length === 0
         && evaluationRecoveryRequired.length === 0
         && pendingEvaluationCleanup.length === 0
@@ -1685,6 +1827,15 @@ export class FwaApplication {
       pendingWorkspaceCleanup,
       preservedWorkspaces,
       unknownWorkspaces,
+      workspaceArchives: workspaceArchives.map((archive) => ({
+        runId: archive.manifest.runId,
+        archivePath: archive.archivePath,
+        manifestDigest: archive.manifestDigest,
+        treeDigest: archive.treeDigest,
+        entryCount: archive.entries.length
+      })),
+      workspaceArchiveErrors,
+      unreferencedWorkspaceArchives,
       activeEvaluations,
       evaluationRecoveryRequired,
       pendingEvaluationCleanup,
@@ -1708,7 +1859,7 @@ export class FwaApplication {
       const store = await this.store.readAll();
       const projection = projectEvents(store.events);
       return { project, store, projection };
-    });
+    }, { readOnly: true });
   }
 
   async #appendBatch(commandId, events, options) {
@@ -1755,7 +1906,7 @@ export class FwaApplication {
     }
   }
 
-  async #withLockRetry(operation) {
+  async #withLockRetry(operation, { readOnly = false } = {}) {
     for (let attempt = 0; ; attempt += 1) {
       try {
         return await operation();
@@ -1763,7 +1914,11 @@ export class FwaApplication {
         const transientWindowsOpenRace = error?.code === 'lock-acquire-failed'
           && ['EPERM', 'EACCES', 'EBUSY'].includes(error?.cause?.code)
           && error?.cause?.syscall === 'open';
-        if ((error?.code !== 'event-store-locked' && !transientWindowsOpenRace)
+        // A reader may see a writer's complete or partial lock publication temp
+        // before its atomic link. Re-read and re-verify within the existing
+        // budget; persistent residue still fails, and writes gain no retries.
+        const pendingPublication = readOnly && error?.code === 'orphan-temporary-lock';
+        if ((error?.code !== 'event-store-locked' && !transientWindowsOpenRace && !pendingPublication)
           || attempt >= this.lockRetryDelays.length) {
           throw error;
         }

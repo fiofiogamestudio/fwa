@@ -24,6 +24,7 @@ Usage:
   fwa git recover --fence-id <id> --confirm-processes-stopped [--project <path>] [--json]
   fwa run next <input.json> [--executor <file-operations|codex>] [--base <revision>] [--node <id>] [--command-id <id>] [--project <path>] [--json]
   fwa run reconcile [--correlation-id <id>] [--project <path>] [--json]
+  fwa run archive <run-id> [--command-id <id>] [--project <path>] [--json]
   fwa evaluate run <changeset-id> <profile.json> [--command-id <id>] [--project <path>] [--json]
   fwa evaluate reconcile [--correlation-id <id>] [--project <path>] [--json]
   fwa integrate apply <changeset-id> --target <branch> [--command-id <id>] [--project <path>] [--json]
@@ -583,6 +584,25 @@ export async function runCli(argv, io = {}) {
         item.cleanup?.worktreeRemoved !== true || item.cleanup?.leaseReleased !== true
       ));
       return cleanupFailed ? 1 : 0;
+    }
+
+    if (positionals[0] === 'run' && positionals[1] === 'archive') {
+      requireShape(
+        positionals,
+        ['run', 'archive', null],
+        'fwa run archive <run-id> [--command-id <id>] [--project <path>] [--json]'
+      );
+      rejectOptions(options, ['project', 'commandId']);
+      result = await application().archiveRunWorkspace({
+        runId: positionals[2],
+        commandId: options.commandId,
+        workspace: new GitWorktreeAdapter(projectRoot)
+      });
+      if (wantsJson) writeJson(stdout, result);
+      else writeLine(stdout, result.ok
+        ? `Archived Run ${result.run.id} workspace to ${result.archive.archivePath}.`
+        : `Run ${result.run?.id ?? positionals[2]} workspace archive did not complete.`);
+      return result.ok ? 0 : 1;
     }
 
     if (positionals[0] === 'evaluate' && positionals[1] === 'run') {

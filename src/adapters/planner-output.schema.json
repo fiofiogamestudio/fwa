@@ -10,13 +10,20 @@
     }},
     "nodes": {"type": "array", "items": {
       "type": "object", "additionalProperties": false,
-      "required": ["id", "title", "parentId", "instruction", "dependsOn", "reads", "writes", "checks", "maxFiles", "maxDiffLines"],
+      "required": ["id", "title", "parentId", "instruction", "outcome", "dependencyReasons", "derivedFrom", "resources", "dependsOn", "reads", "writes", "checks", "maxFiles", "maxDiffLines"],
       "properties": {
         "id": {"type": "string"}, "title": {"type": "string"}, "parentId": {"type": "string"}, "instruction": {"type": "string"},
+        "outcome": {"type": ["string", "null"]},
+        "dependencyReasons": {"type": ["array", "null"], "items": {
+          "type": "object", "additionalProperties": false, "required": ["nodeId", "reason"],
+          "properties": {"nodeId": {"type": "string"}, "reason": {"type": "string"}}
+        }},
+        "derivedFrom": {"type": ["string", "null"]},
+        "resources": {"type": ["array", "null"], "items": {"type": "string"}},
         "dependsOn": {"type": "array", "items": {"type": "string"}},
         "reads": {"type": "array", "items": {"type": "string"}},
         "writes": {"type": "array", "items": {"type": "string"}},
-        "checks": {"type": "array", "items": {"type": "string"}},
+        "checks": {"type": ["array", "null"], "items": {"type": "string"}},
         "maxFiles": {"type": "integer"}, "maxDiffLines": {"type": "integer"}
       }
     }}

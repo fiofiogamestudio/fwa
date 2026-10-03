@@ -47,7 +47,8 @@ test('package exports keep application, core, and storage entry points explicit'
     './adapters/unity-evaluator-profile': './src/adapters/unity-evaluator-profile.js',
     './storage/artifact-store': './src/storage/artifact-store.js',
     './storage/file-event-store': './src/storage/file-event-store.js',
-    './storage/workspace-lease': './src/storage/workspace-lease.js'
+    './storage/workspace-lease': './src/storage/workspace-lease.js',
+    './storage/workspace-archive': './src/storage/workspace-archive.js'
   });
 
   const applicationApi = await import('fwa');
@@ -57,6 +58,7 @@ test('package exports keep application, core, and storage entry points explicit'
   const integrationWorkspaceApi = await import('fwa/adapters/git-integration-workspace');
   const regressionGateApi = await import('fwa/application/integration-regression-gate');
   const storageApi = await import('fwa/storage/file-event-store');
+  const archiveApi = await import('fwa/storage/workspace-archive');
   assert.equal(typeof applicationApi.FwaApplication, 'function');
   assert.equal(typeof applicationApi.EvaluationOrchestrator, 'function');
   assert.equal(typeof applicationApi.IntegrationOrchestrator, 'function');
@@ -66,6 +68,7 @@ test('package exports keep application, core, and storage entry points explicit'
   assert.equal(typeof applicationApi.CodexExecutor, 'function');
   assert.equal(typeof applicationApi.createUnityEvaluatorProfile, 'function');
   assert.equal(typeof applicationApi.runIntegrationRegressionGate, 'function');
+  assert.equal(typeof archiveApi.WorkspaceArchiveStore, 'function');
   assert.equal(applicationApi.CodexExecutor, codexApi.CodexExecutor);
   assert.equal(
     applicationApi.createUnityEvaluatorProfile,

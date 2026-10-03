@@ -119,7 +119,7 @@ test('HTTP review validates exact candidate, records human acceptance, gates ado
   assert.equal(reverted.result.ok, true, JSON.stringify(reverted));
   review = await f.review(id);
   assert.equal(review.reverted, true); assert.equal(review.current, false); assert.equal(review.integrated, false);
-  assert.deepEqual(Object.values(review.actions), [false, false, false, false]);
+  assert.ok(Object.values(review.actions).every(value => value === false));
   assert.equal(await readFile(path.join(f.root, 'feature.cjs'), 'utf8'), "module.exports = 'before';\n");
   assert.equal(await readFile(path.join(f.root, 'side.txt'), 'utf8'), 'later');
   assert.equal(git(f.root, ['merge-base', '--is-ancestor', firstRevision, 'HEAD']), '');

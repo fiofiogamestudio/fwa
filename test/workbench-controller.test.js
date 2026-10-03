@@ -14,6 +14,7 @@ import { assertProjectWorkScope } from '../src/application/workbench-policy.js';
 function rawPlan() {
   return { title: 'Fixture feature', questions: [], groups: [{ id: 'feature', title: 'Feature', parentId: '' }], nodes: [
     { id: 'one', title: 'Implement one', parentId: 'feature', instruction: 'Create src/one.txt with the specified content.',
+      outcome: 'The requested content is available in the output.', dependencyReasons: [], derivedFrom: null, resources: [],
       dependsOn: [], reads: ['seed.txt'], writes: ['src/one.txt'], checks: ['The output matches the brief'], maxFiles: 2, maxDiffLines: 100 }
   ] };
 }
@@ -33,6 +34,8 @@ async function fixture(t) {
 test('planner accepts hierarchy, refuses fake questions-plus-work and enforces framework scope', () => {
   const output = parsePlannerResponse(rawPlan(), { prefix: 'fixture' });
   assert.equal(output.plan.nodes[0].parentId, 'fixture-feature');
+  assert.equal(Object.hasOwn(output.plan.nodes[0].budget, 'wallTimeMinutes'), false);
+  assert.equal(output.plan.nodes[0].budget.maxRetries, 2);
   assert.equal(assertProjectWorkScope(output.plan.nodes[0]).writes[0], 'src/one.txt');
   for (const writes of [['fw/fwa/index.js'], ['FW/foo'], ['**'], ['*/file'], ['../outside'], ['.fwa/events/a']]) {
     assert.throws(() => assertProjectWorkScope({ reads: [], writes }));
@@ -48,14 +51,19 @@ test('planner retains existing logical IDs across revisions', () => {
   assert.equal(next.plan.nodes[0].id, initial.plan.nodes[0].id);
   assert.throws(() => parsePlannerResponse(rawPlan(), { prefix: 'new-operation', existingPlan: initial.plan }), /retain every existing logical leaf/);
   initial.plan.nodes[0].resources = ['editor'];
+  initial.plan.nodes[0].budget.wallTimeMinutes = 20;
   initial.plan.nodes[0].acceptance.commands = ['trusted-check'];
   initial.plan.nodes[0].acceptance.evaluators = ['trusted-evaluator'];
+  raw.nodes[0].resources = null;
   const preserved = parsePlannerResponse(raw, { prefix: 'new-operation', existingPlan: initial.plan }).plan.nodes[0];
   assert.deepEqual(preserved.resources, ['editor']);
+  assert.equal(preserved.budget.wallTimeMinutes, 20);
   assert.deepEqual(preserved.acceptance.commands, ['trusted-check']);
   assert.deepEqual(preserved.acceptance.evaluators, ['trusted-evaluator']);
   initial.plan.nodes[0].acceptance = 'trusted-contract';
   assert.throws(() => parsePlannerResponse(raw, { prefix: 'new-operation', existingPlan: initial.plan }), /named acceptance contract/);
+  raw.nodes[0].checks = null;
+  assert.equal(parsePlannerResponse(raw, { prefix: 'new-operation', existingPlan: initial.plan }).plan.nodes[0].acceptance, 'trusted-contract');
 });
 
 test('configured planning exposes trusted criteria and refuses an unverifiable plan before creating a goal', async t => {
@@ -247,10 +255,10 @@ test('a mixed batch retains every output but stops all automatic acceptance, inc
   assert.deepEqual(f.batch, f.originalBatch);
 });
 
-test('nonempty batches retain the trusted acceptance path without inventing a no-changes warning', async t => {
+test('a trusted callback without actual integration stops instead of claiming progress', async t => {
   const f = await batchControllerFixture(t, [1, 2]);
   const result = await f.controller.runGoal({ commandId: 'nonempty-batch', goalId: f.goal.id });
-  assert.equal(result.stopReason, 'no-ready-leaves');
+  assert.equal(result.stopReason, 'acceptance-incomplete');
   assert.equal(Object.hasOwn(result, 'noChanges'), false);
   assert.deepEqual(f.accepted, ['changeset-0', 'changeset-1']);
   assert.equal(f.dispatches(), 1); assert.deepEqual(f.batch, f.originalBatch);

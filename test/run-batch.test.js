@@ -11,18 +11,18 @@ import { FileOperationsExecutor, FILE_OPERATIONS_CAPABILITY } from '../src/adapt
 import { GitWorktreeAdapter } from '../src/adapters/git-worktree.js';
 import { findParallelConflicts } from '../src/core/scheduling.js';
 
-function command(cwd, executable, args, allowed = [0]) {
+function command(cwd, executable, args, allowed = [0], timeoutMs = 20_000) {
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, { cwd, shell: false, windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = ''; let stderr = '';
-    const timer = setTimeout(() => child.kill(), 20_000);
+    let stdout = ''; let stderr = ''; let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill(); }, timeoutMs);
     child.stdout.on('data', (chunk) => { stdout += chunk; });
     child.stderr.on('data', (chunk) => { stderr += chunk; });
     child.on('error', (error) => { clearTimeout(timer); reject(error); });
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (!allowed.includes(code)) reject(new Error(`${executable} ${args.join(' ')}: ${code}\n${stderr}\n${stdout}`));
+      if (!allowed.includes(code)) reject(new Error(`${executable} ${args.join(' ')}: ${code} (timedOut=${timedOut}, timeoutMs=${timeoutMs})\n${stderr}\n${stdout}`));
       else resolve({ stdout, stderr, code });
     });
   });
@@ -162,7 +162,8 @@ test('dead batch coordinator requires explicit process confirmation, then preser
       async execute(){count++;if(count===2)process.exit(17);await new Promise(()=>{});}};
     await app.runReadyBatch({executions:[{nodeId:'left',input:{}},{nodeId:'right',input:{}}],executor,
       workspace:new GitWorktreeAdapter(root),commandId:'crashed-batch'});`;
-  await command(root, process.execPath, ['--input-type=module', '--eval', script], [17]);
+  // This child prepares two real Git worktrees before intentionally exiting.
+  await command(root, process.execPath, ['--input-type=module', '--eval', script], [17], 120_000);
   const status = await app.getStatus();
   assert.equal(status.runs.filter((run) => run.status === 'running').length, 2);
   assert.equal((await app.reconcileRunBatch()).reason, 'process-stop-confirmation-required');

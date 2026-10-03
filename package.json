@@ -16,7 +16,8 @@
     "./adapters/unity-evaluator-profile": "./src/adapters/unity-evaluator-profile.js",
     "./storage/artifact-store": "./src/storage/artifact-store.js",
     "./storage/file-event-store": "./src/storage/file-event-store.js",
-    "./storage/workspace-lease": "./src/storage/workspace-lease.js"
+    "./storage/workspace-lease": "./src/storage/workspace-lease.js",
+    "./storage/workspace-archive": "./src/storage/workspace-archive.js"
   },
   "bin": {
     "fwa": "bin/fwa.js"
